@@ -1,0 +1,182 @@
+From 9cfc622645ebc671b2a454c973fe93c75ddb1c6e Mon Sep 17 00:00:00 2001
+From: bench <bench@local>
+Date: Sun, 25 Oct 2026 00:34:39 +0000
+Subject: [PATCH 1/4] expert_pack: flag-gated miss_tier_probe (page-cache
+ residency per miss)
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ python/sglang/srt/layers/moe/expert_pack.py   | 80 ++++++++++++++++++-
+ .../srt/model_loader/expert_pack_loader.py    |  1 +
+ 2 files changed, 79 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/expert_pack.py b/python/sglang/srt/layers/moe/expert_pack.py
+index bdbc353..6110291 100644
+--- a/python/sglang/srt/layers/moe/expert_pack.py
++++ b/python/sglang/srt/layers/moe/expert_pack.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ 
+ import atexit
+ import concurrent.futures
++import ctypes
+ import hashlib
+ import json
+ import logging
+@@ -167,6 +168,7 @@ def _initialize_runtime_state(
+     direct_io: bool,
+     stats_flush_interval: int,
+     stats_path: str | os.PathLike[str] | None,
++    miss_tier_probe: bool = False,
+ ) -> None:
+     store.cache_vram_mib = int(cache_vram_mib)
+     store.cache_vram_reserve_mib = int(cache_vram_reserve_mib)
+@@ -226,6 +228,36 @@ def _initialize_runtime_state(
+         "fallback_count": 0,
+         "io_errors": 0,
+     }
++    store.miss_tier_probe = bool(miss_tier_probe)
++    store._probe_map = None
++    if store.miss_tier_probe:
++        # Instrumentation: classify every cache miss by page-cache residency of
++        # the expert object *before* its read is issued (mincore(2)).  With
++        # direct_io=False a fully resident object is served from DRAM (page
++        # cache); with direct_io=True O_DIRECT bypasses the page cache, so the
++        # residency counters are informational and every miss is device-served.
++        store._libc = ctypes.CDLL(None, use_errno=True)
++        store._libc.mmap.restype = ctypes.c_void_p
++        store._libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
++                                     ctypes.c_int, ctypes.c_int, ctypes.c_long]
++        store._libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p]
++        store._probe_fd = os.open(store.path, os.O_RDONLY)
++        store._probe_len = os.fstat(store._probe_fd).st_size
++        addr = store._libc.mmap(None, store._probe_len, 1, 1, store._probe_fd, 0)  # PROT_READ, MAP_SHARED
++        if addr in (None, ctypes.c_void_p(-1).value):
++            raise OSError(ctypes.get_errno(), "expert-pack tier probe mmap failed")
++        store._probe_map = addr
++        store._page = os.sysconf("SC_PAGE_SIZE")
++        store.stats.update({
++            "miss_tier_probe": True,
++            "miss_pagecache_resident": 0,
++            "miss_pagecache_partial": 0,
++            "miss_pagecache_absent": 0,
++            "miss_pagecache_resident_ns": 0,
++            "miss_pagecache_absent_ns": 0,
++            "miss_pagecache_resident_bytes": 0,
++            "read_latency_hist_us": {},
++        })
+     atexit.register(store.close)
+ 
+ 
+@@ -251,6 +283,7 @@ class ExpertPackStore:
+         stats_flush_interval: int = 0,
+         verify_pack_sha256: bool = False,
+         stats_path: str | os.PathLike[str] | None = None,
++        miss_tier_probe: bool = False,
+     ) -> None:
+         self.path = Path(pack_path).resolve()
+         self.manifest_path = Path(
+@@ -360,6 +393,7 @@ class ExpertPackStore:
+             direct_io=direct_io,
+             stats_flush_interval=stats_flush_interval,
+             stats_path=stats_path,
++            miss_tier_probe=miss_tier_probe,
+         )
+ 
+     def initialize_device_cache(self, device: torch.device | str) -> None:
+@@ -499,6 +533,35 @@ class ExpertPackStore:
+             ready.record(stream)
+         return ready
+ 
++    def _probe_residency(self, layer: int, expert: int) -> tuple[int, int]:
++        """Return (resident_bytes, total_bytes) of one object in the page cache."""
++        start = self.object_offsets[(layer, expert)]
++        length = self.object_payload_bytes
++        page = self._page
++        aligned = start - (start % page)
++        span = (start + length - aligned + page - 1) // page * page
++        vec = ctypes.create_string_buffer(span // page)
++        if self._libc.mincore(self._probe_map + aligned, span, vec) != 0:
++            raise OSError(ctypes.get_errno(), "mincore failed")
++        resident_pages = sum(byte & 1 for byte in vec.raw)
++        return min(resident_pages * page, length), length
++
++    def _record_miss_tier(self, resident: int, total: int, elapsed: int) -> None:
++        bucket_us = 1
++        while bucket_us * 1000 < elapsed:
++            bucket_us *= 2
++        hist = self.stats["read_latency_hist_us"]
++        hist[str(bucket_us)] = int(hist.get(str(bucket_us), 0)) + 1
++        if resident >= total:
++            self.stats["miss_pagecache_resident"] += 1
++            self.stats["miss_pagecache_resident_ns"] += elapsed
++        elif resident == 0:
++            self.stats["miss_pagecache_absent"] += 1
++            self.stats["miss_pagecache_absent_ns"] += elapsed
++        else:
++            self.stats["miss_pagecache_partial"] += 1
++        self.stats["miss_pagecache_resident_bytes"] += resident
++
+     def _record_read(self, read_bytes: int, elapsed: int) -> None:
+         self.stats["pack_reads"] = int(self.stats["pack_reads"]) + 1
+         self.stats["pack_read_bytes"] = int(self.stats["pack_read_bytes"]) + read_bytes
+@@ -582,6 +645,11 @@ class ExpertPackStore:
+                     if stage_event is not None:
+                         stage_event.synchronize()
+                     staging = self._staging[stage_index]
++                    residency = (
++                        self._probe_residency(key[0], key[1])
++                        if self._probe_map is not None
++                        else None
++                    )
+                     futures = tuple(
+                         self._read_executor.submit(
+                             self._read_object_range,
+@@ -593,9 +661,11 @@ class ExpertPackStore:
+                         )
+                         for start, length in self._object_read_ranges()
+                     )
+-                    jobs.append((futures, key, stage_index, staging, slot_index))
++                    jobs.append(
++                        (futures, key, stage_index, staging, slot_index, residency)
++                    )
+ 
+-                for futures, key, stage_index, staging, slot_index in jobs:
++                for futures, key, stage_index, staging, slot_index, residency in jobs:
+                     if futures:
+                         try:
+                             results = [future.result() for future in futures]
+@@ -605,6 +675,8 @@ class ExpertPackStore:
+                         read_bytes = sum(result[0] for result in results)
+                         elapsed = max(result[1] for result in results)
+                         self._record_read(read_bytes, elapsed)
++                        if residency is not None:
++                            self._record_miss_tier(*residency, elapsed)
+                     slot = self._cache_slots[slot_index]
+                     if slot.ready is not None:
+                         self._transfer_stream.wait_event(slot.ready)
+@@ -694,6 +766,10 @@ class ExpertPackStore:
+         if getattr(self, "_fd", -1) >= 0:
+             os.close(self._fd)
+             self._fd = -1
++        if getattr(self, "_probe_map", None) is not None:
++            self._libc.munmap(ctypes.c_void_p(self._probe_map), self._probe_len)
++            os.close(self._probe_fd)
++            self._probe_map = None
+ 
+ 
+ class KimiGGMLExpertPackStore(ExpertPackStore):
+diff --git a/python/sglang/srt/model_loader/expert_pack_loader.py b/python/sglang/srt/model_loader/expert_pack_loader.py
+index 02f69d9..8226a3f 100644
+--- a/python/sglang/srt/model_loader/expert_pack_loader.py
++++ b/python/sglang/srt/model_loader/expert_pack_loader.py
+@@ -253,6 +253,7 @@ class ExpertPackModelLoader(BaseModelLoader):
+                 direct_io=bool(self.config.get("direct_io", True)),
+                 stats_flush_interval=int(self.config.get("stats_flush_interval", 0)),
+                 stats_path=stats_path,
++                miss_tier_probe=bool(self.config.get("miss_tier_probe", False)),
+             )
+             weights = deepseek4_nonexpert_weights_iterator(
+                 self.source_path, int(hf_config.num_hidden_layers)
+-- 
+2.43.0
+

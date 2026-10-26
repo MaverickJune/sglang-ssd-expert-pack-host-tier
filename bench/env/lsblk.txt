@@ -1,0 +1,13 @@
+NAME        MODEL                                      SIZE ROTA TRAN   FSTYPE MOUNTPOINTS
+loop0                                                 63.8M    0               
+loop1                                                 63.8M    0               
+loop2                                                   74M    0               
+loop3                                                   74M    0               
+loop4                                                115.3M    0               
+loop5                                                115.2M    0               
+loop6                                                 50.3M    0               
+loop7                                                 44.7M    0               
+nvme0n1     Samsung SSD 990 PRO 4TB                    3.6T    0 nvme          
+├─nvme0n1p1                                              1G    0 nvme          
+├─nvme0n1p2                                              2G    0 nvme          
+└─nvme0n1p3                                            3.6T    0 nvme          

@@ -1,0 +1,2 @@
+/ O_DIRECT read OK bytes 1048576
+/workspace O_DIRECT read OK bytes 1048576

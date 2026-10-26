@@ -1,0 +1,9 @@
+[01] alpaca-37246                             ptok=  18 ctok=200 prefill=3.92 decode=3.049 hits=30190 misses=23411 hit_rate=0.563 pack_read=312.99GB disk_read=5.66GB io_err=0 complete=True
+[02] mmlu-abstract_algebra-14                 ptok=  64 ctok=200 prefill=4.86 decode=2.719 hits=24034 misses=31595 hit_rate=0.432 pack_read=422.40GB disk_read=14.13GB io_err=0 complete=True
+[03] alpaca-50812                             ptok=  28 ctok=200 prefill=4.41 decode=3.142 hits=31893 misses=22260 hit_rate=0.589 pack_read=297.60GB disk_read=6.34GB io_err=0 complete=True
+[04] mmlu-moral_disputes-8315                 ptok= 114 ctok= 95 prefill=5.56 decode=2.772 hits=13268 misses=16624 hit_rate=0.444 pack_read=222.25GB disk_read=10.29GB io_err=0 complete=True
+[05] alpaca-9907                              ptok=  25 ctok=122 prefill=4.16 decode=2.833 hits=16443 misses=17694 hit_rate=0.482 pack_read=236.56GB disk_read=4.63GB io_err=0 complete=True
+[06] mmlu-high_school_macroeconomics-3940     ptok= 132 ctok=200 prefill=5.82 decode=2.920 hits=28293 misses=28577 hit_rate=0.498 pack_read=382.06GB disk_read=9.20GB io_err=0 complete=True
+[07] alpaca-40699                             ptok=  24 ctok=200 prefill=4.32 decode=3.110 hits=31291 misses=22613 hit_rate=0.580 pack_read=302.32GB disk_read=4.70GB io_err=0 complete=True
+[08] mmlu-professional_law-10971              ptok= 287 ctok=200 prefill=42.23 decode=2.844 hits=26983 misses=27106 hit_rate=0.499 pack_read=362.39GB disk_read=6.90GB io_err=0 complete=True
+[09] alpaca-34440                             ptok=  30 ctok=200 prefill=4.38 decode=3.018 hits=29899 misses=24415 hit_rate=0.550 pack_read=326.41GB disk_read=5.58GB io_err=0 complete=True

@@ -1,0 +1,46 @@
+From 15826211080d4e4be5be085191277ae3d3c2cb1f Mon Sep 17 00:00:00 2001
+From: bench <bench@local>
+Date: Sun, 25 Oct 2026 03:09:34 +0000
+Subject: [PATCH 4/4] expert_pack tier: let the transient pool use up to half
+ of cache_vram_reserve
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ python/sglang/srt/layers/moe/expert_pack.py | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/layers/moe/expert_pack.py b/python/sglang/srt/layers/moe/expert_pack.py
+index e7768fe..654e932 100644
+--- a/python/sglang/srt/layers/moe/expert_pack.py
++++ b/python/sglang/srt/layers/moe/expert_pack.py
+@@ -473,12 +473,26 @@ class ExpertPackStore:
+             else 0
+         )
+         pool_bytes = pool_slots * self.object_payload_bytes
+-        if pool_bytes and free_bytes - reserve - cache_bytes < pool_bytes:
++        # The pool is allocated on top of the retained budget (slot_count is
++        # unchanged).  When the retained budget was already capped by
++        # free - reserve, the pool may use up to half of the reserve; beyond
++        # that we fail closed rather than shrink the retained cache silently.
++        pool_from_reserve = max(0, pool_bytes - max(0, free_bytes - reserve - cache_bytes))
++        if pool_bytes and pool_from_reserve > reserve // 2:
+             raise MemoryError(
+                 "insufficient free VRAM for the transient expert pool on top of "
+                 f"cache_vram_mib: free={free_bytes} reserve={reserve} "
+                 f"cache={cache_bytes} pool={pool_bytes}"
+             )
++        if pool_from_reserve:
++            logger.warning(
++                "Expert pack transient pool takes %d bytes out of the %d-byte "
++                "cache_vram_reserve (retained cache unchanged at %d slots)",
++                pool_from_reserve,
++                reserve,
++                slot_count,
++            )
++        self.stats["transient_pool_from_reserve_bytes"] = pool_from_reserve
+         self._cache = torch.empty(
+             (slot_count + pool_slots, self.object_payload_bytes),
+             dtype=torch.uint8,
+-- 
+2.43.0
+

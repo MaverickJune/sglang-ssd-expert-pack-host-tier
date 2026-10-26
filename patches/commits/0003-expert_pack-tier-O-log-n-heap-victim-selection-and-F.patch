@@ -1,0 +1,597 @@
+From f2f5c45791bdc91461f09a24085c626a82df74d1 Mon Sep 17 00:00:00 2001
+From: bench <bench@local>
+Date: Sun, 25 Oct 2026 02:52:34 +0000
+Subject: [PATCH 3/4] expert_pack tier: O(log n) heap victim selection and FIFO
+ transient pool
+
+Retained victims come from a lazy min-heap keyed (access_count, last_access,
+slot_index), identical to the previous full scan including tie-break.
+Transient entries use transient_slots (default 4*top_k) extra VRAM slots
+allocated on top of cache_vram_mib and reused FIFO, so a slot just read by
+layer k's kernel is not overwritten by layer k+1's H2D.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ python/sglang/srt/layers/moe/expert_pack.py   |  40 ++++-
+ .../sglang/srt/layers/moe/expert_pack_tier.py | 159 ++++++++++++++----
+ .../srt/model_loader/expert_pack_loader.py    |   5 +
+ .../expert_pack/test_expert_pack_tier_gpu.py  |  38 ++++-
+ .../test_expert_pack_tier_policy.py           |  96 ++++++++++-
+ 5 files changed, 287 insertions(+), 51 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/expert_pack.py b/python/sglang/srt/layers/moe/expert_pack.py
+index fde2ccd..e7768fe 100644
+--- a/python/sglang/srt/layers/moe/expert_pack.py
++++ b/python/sglang/srt/layers/moe/expert_pack.py
+@@ -175,9 +175,18 @@ def _initialize_runtime_state(
+     vram_admission_policy: str = "lru",
+     admission_min_accesses: int = 2,
+     admission_window_steps: int = 8,
++    transient_slots: int | None = None,
+ ) -> None:
+     store.cache_vram_mib = int(cache_vram_mib)
+     store.host_cache_mib = int(host_cache_mib)
++    # Transient pool: extra VRAM slots *on top of* cache_vram_mib (default 4 x top-k),
++    # only with the paper policy; 0 disables the pool (transients then use the
++    # retained region as in the first E2-E4 runs).
++    if transient_slots is None:
++        transient_slots = 4 * int(store.header.top_k)
++    store.transient_slots = int(transient_slots)
++    if store.transient_slots < 0:
++        raise ValueError("transient_slots cannot be negative")
+     store.vram_admission_policy = str(vram_admission_policy)
+     store.admission_min_accesses = int(admission_min_accesses)
+     store.admission_window_steps = int(admission_window_steps)
+@@ -260,6 +269,7 @@ def _initialize_runtime_state(
+             "vram_admission_policy": store.vram_admission_policy,
+             "admission_min_accesses": store.admission_min_accesses,
+             "admission_window_steps": store.admission_window_steps,
++            "transient_slots": store.transient_slots if store.vram_admission_policy == "paper" else 0,
+             "demotion_d2h_bytes": 0,
+         })
+     store.miss_tier_probe = bool(miss_tier_probe)
+@@ -322,6 +332,7 @@ class ExpertPackStore:
+         vram_admission_policy: str = "lru",
+         admission_min_accesses: int = 2,
+         admission_window_steps: int = 8,
++        transient_slots: int | None = None,
+     ) -> None:
+         self.path = Path(pack_path).resolve()
+         self.manifest_path = Path(
+@@ -436,6 +447,7 @@ class ExpertPackStore:
+             vram_admission_policy=vram_admission_policy,
+             admission_min_accesses=admission_min_accesses,
+             admission_window_steps=admission_window_steps,
++            transient_slots=transient_slots,
+         )
+ 
+     def initialize_device_cache(self, device: torch.device | str) -> None:
+@@ -455,12 +467,26 @@ class ExpertPackStore:
+                 f"free={free_bytes}, object={self.object_payload_bytes}"
+             )
+         cache_bytes = slot_count * self.object_payload_bytes
++        pool_slots = (
++            self.transient_slots
++            if self.tiered and self.vram_admission_policy == "paper"
++            else 0
++        )
++        pool_bytes = pool_slots * self.object_payload_bytes
++        if pool_bytes and free_bytes - reserve - cache_bytes < pool_bytes:
++            raise MemoryError(
++                "insufficient free VRAM for the transient expert pool on top of "
++                f"cache_vram_mib: free={free_bytes} reserve={reserve} "
++                f"cache={cache_bytes} pool={pool_bytes}"
++            )
+         self._cache = torch.empty(
+-            (slot_count, self.object_payload_bytes),
++            (slot_count + pool_slots, self.object_payload_bytes),
+             dtype=torch.uint8,
+             device=device,
+         )
+-        self._cache_slots = [_CacheSlot() for _ in range(slot_count)]
++        self._cache_slots = [_CacheSlot() for _ in range(slot_count + pool_slots)]
++        self.stats["transient_pool_slots"] = pool_slots
++        self.stats["transient_pool_bytes"] = pool_bytes
+         self._staging = [
+             torch.empty(self.object_payload_bytes, dtype=torch.uint8, pin_memory=True)
+             for _ in range(self.stage_slot_count)
+@@ -790,18 +816,22 @@ class ExpertPackStore:
+             policy=self.vram_admission_policy,
+             admission_min_accesses=self.admission_min_accesses,
+             admission_window_steps=self.admission_window_steps,
++            transient_slots=int(self.stats.get("transient_pool_slots", 0)),
+         )
+         self._first_active_layer = min(self.active_moe_layer_ids)
+         self.stats["host_cache_slots"] = ram_slot_count
+         self.stats["host_cache_bytes"] = ram_slot_count * self.object_payload_bytes
+         logger.info(
+             "Expert pack host tier: policy=%s ram_slots=%d ram_bytes=%d "
+-            "admission=(min_accesses=%d, window=%d steps)",
++            "admission=(min_accesses=%d, window=%d steps) retained_vram_slots=%d "
++            "transient_pool_slots=%d",
+             self.vram_admission_policy,
+             ram_slot_count,
+             ram_slot_count * self.object_payload_bytes,
+             self.admission_min_accesses,
+             self.admission_window_steps,
++            vram_slot_count,
++            int(self.stats.get("transient_pool_slots", 0)),
+         )
+ 
+     @staticmethod
+@@ -909,7 +939,9 @@ class ExpertPackStore:
+                 self.stats["cache_misses"] = int(self.stats["cache_misses"]) + 1
+                 worst = SSD if where == SSD or worst == SSD else RAM
+                 retained = tier.should_retain(key)  # decide before freeing a slot
+-                slot_index = tier.pick_vram_victim(requested, preserve_oldest=is_prefill)
++                slot_index = tier.pick_vram_victim(
++                    requested, retained=retained, preserve_oldest=is_prefill
++                )
+                 self._evict_vram_slot(slot_index, requested)
+                 tier.install_vram(slot_index, key, retained=retained)
+                 slot = self._cache_slots[slot_index]
+diff --git a/python/sglang/srt/layers/moe/expert_pack_tier.py b/python/sglang/srt/layers/moe/expert_pack_tier.py
+index 234543f..63a227c 100644
+--- a/python/sglang/srt/layers/moe/expert_pack_tier.py
++++ b/python/sglang/srt/layers/moe/expert_pack_tier.py
+@@ -21,9 +21,18 @@ events and file reads and asks this object only *where* an expert is and
+   meets the rule is promoted to retained;
+ * VRAM eviction ("paper"): free slot, else oldest transient slot, else the
+   retained entry with the lexicographically smallest (access_count,
+-  last_access); the current update's working set is never evicted.  The
+-  evicted expert is demoted to RAM when RAM has space (free slot, or its bytes
+-  are still RAM-resident), otherwise discarded;
++  last_access, slot_index); the current update's working set is never
++  evicted.  Retained candidates are kept in a lazy min-heap keyed exactly on
++  that triple (stale entries are skipped by a per-slot version), so the
++  victim is identical to a full scan but costs O(log n) instead of O(n);
++* transient pool: ``transient_slots`` extra VRAM slots (allocated by the
++  store on top of the retained budget) hold transient entries and are reused
++  FIFO (oldest install first), so a slot just read by layer k's kernel is not
++  the one layer k+1's H2D overwrites.  When the pool is exhausted within one
++  update (large prefill), further transient installs fall back to evicting
++  from the retained region exactly as before.  The evicted expert is demoted
++  to RAM when RAM has space (free slot, or its bytes are still RAM-resident),
++  otherwise discarded;
+ * RAM eviction: LRU, never an entry whose SSD read / H2D / D2H is in flight
+   (the store tells us which slots are busy);
+ * ``policy="lru"`` reproduces the original reuse-LFU/LRU victim rule.
+@@ -31,9 +40,10 @@ events and file reads and asks this object only *where* an expert is and
+ 
+ from __future__ import annotations
+ 
+-from collections import OrderedDict
+-from dataclasses import dataclass, field
+-from typing import Callable, Hashable, Optional
++import heapq
++from collections import OrderedDict, deque
++from dataclasses import dataclass
++from typing import Callable, Optional
+ 
+ Key = tuple[int, int]
+ VRAM, RAM, SSD = "vram", "ram", "ssd"
+@@ -44,6 +54,7 @@ class VramEntry:
+     key: Optional[Key] = None
+     retained: bool = True
+     last_use_step: int = -1
++    seq: int = 0  # install sequence number (FIFO order of transient entries)
+ 
+ 
+ @dataclass
+@@ -80,17 +91,28 @@ class TierPolicy:
+         policy: str = "paper",
+         admission_min_accesses: int = 2,
+         admission_window_steps: int = 8,
++        transient_slots: int = 0,
+     ) -> None:
+         if policy not in ("lru", "paper"):
+             raise ValueError(f"unknown vram_admission_policy {policy!r}")
+-        if vram_slots <= 0 or ram_slots < 0:
+-            raise ValueError("vram_slots must be positive and ram_slots non-negative")
++        if vram_slots <= 0 or ram_slots < 0 or transient_slots < 0:
++            raise ValueError("vram_slots must be positive; ram/transient slots non-negative")
+         if admission_min_accesses < 1 or admission_window_steps < 0:
+             raise ValueError("invalid admission rule parameters")
++        if transient_slots and policy != "paper":
++            raise ValueError("transient_slots requires vram_admission_policy='paper'")
+         self.policy = policy
+         self.admission_min_accesses = admission_min_accesses
+         self.admission_window_steps = admission_window_steps
+-        self.vram: list[VramEntry] = [VramEntry() for _ in range(vram_slots)]
++        # Slots [0, retained_slots) are the retained budget (cache_vram_mib);
++        # slots [retained_slots, retained_slots + transient_slots) are the pool.
++        self.retained_slots = vram_slots
++        self.transient_slots = transient_slots
++        self.vram: list[VramEntry] = [VramEntry() for _ in range(vram_slots + transient_slots)]
++        self._version: list[int] = [0] * len(self.vram)
++        self._heap: list[tuple[int, int, int, int]] = []  # (access_count, last_access, idx, version)
++        self._fifo: deque[tuple[int, int]] = deque()  # (seq, idx) of transient installs
++        self._seq = 0
+         self.key_to_vram: dict[Key, int] = {}
+         self.vram_lru: "OrderedDict[Key, None]" = OrderedDict()
+         self.history: dict[Key, History] = {}
+@@ -121,9 +143,11 @@ class TierPolicy:
+             self.vram_lru.move_to_end(key)
+             entry = self.vram[idx]
+             entry.last_use_step = self.step
+-            if not entry.retained and self.should_retain(key):
+-                entry.retained = True
+-                self.stats.promotions += 1
++            if entry.retained:
++                self._heap_push(idx)  # score changed (access_count / last_access)
++            # A transient entry is never promoted in place: it executes from its
++            # temporary slot and is retained on its *next* load if its history
++            # then satisfies should_retain().
+             return VRAM
+         if key in self.ram_lru:
+             self.stats.ram_hits += 1
+@@ -140,7 +164,57 @@ class TierPolicy:
+ 
+     # -------------------------------------------------------------- admission
+     def has_free_vram(self) -> bool:
+-        return any(e.key is None for e in self.vram)
++        return any(e.key is None for e in self.vram[: self.retained_slots])
++
++    # ----------------------------------------------------------------- heap
++    def _heap_push(self, idx: int) -> None:
++        e = self.vram[idx]
++        h = self.history[e.key]
++        self._version[idx] += 1
++        heapq.heappush(self._heap, (h.access_count, h.last_access, idx, self._version[idx]))
++        if len(self._heap) > 4 * len(self.vram) + 64:
++            self._heap = [
++                (self.history[v.key].access_count, self.history[v.key].last_access, i, self._version[i])
++                for i, v in enumerate(self.vram)
++                if v.key is not None and v.retained
++            ]
++            heapq.heapify(self._heap)
++
++    def _heap_min_retained(self, protected: set) -> Optional[int]:
++        """Lowest (access_count, last_access, idx) retained entry not protected."""
++        deferred = []
++        found = None
++        while self._heap:
++            count, last, idx, version = self._heap[0]
++            e = self.vram[idx]
++            if version != self._version[idx] or e.key is None or not e.retained:
++                heapq.heappop(self._heap)  # stale
++                continue
++            if e.key in protected:
++                deferred.append(heapq.heappop(self._heap))
++                continue
++            found = idx
++            break
++        for item in deferred:
++            heapq.heappush(self._heap, item)
++        return found
++
++    def _fifo_oldest_transient(self, protected: set, *, pool_only: bool) -> Optional[int]:
++        deferred = []
++        found = None
++        while self._fifo:
++            seq, idx = self._fifo[0]
++            e = self.vram[idx]
++            if e.key is None or e.retained or e.seq != seq:
++                self._fifo.popleft()  # stale
++                continue
++            if e.key in protected or (pool_only and idx < self.retained_slots):
++                deferred.append(self._fifo.popleft())
++                continue
++            found = idx
++            break
++        self._fifo.extendleft(reversed(deferred))
++        return found
+ 
+     def should_retain(self, key: Key) -> bool:
+         if self.policy == "lru":
+@@ -156,9 +230,21 @@ class TierPolicy:
+         h = self.history.get(key)
+         return min(h.access_count, 255) if h else 0
+ 
+-    def pick_vram_victim(self, protected: set, *, preserve_oldest: bool = False) -> int:
+-        for idx, e in enumerate(self.vram):
+-            if e.key is None:
++    def pick_vram_victim(
++        self, protected: set, *, retained: bool = True, preserve_oldest: bool = False
++    ) -> int:
++        """Slot for a new entry that will be installed with ``retained``."""
++        if self.policy == "paper" and not retained and self.transient_slots:
++            # transient install: free pool slot, else oldest pool entry (FIFO)
++            for idx in range(self.retained_slots, len(self.vram)):
++                if self.vram[idx].key is None:
++                    return idx
++            idx = self._fifo_oldest_transient(protected, pool_only=True)
++            if idx is not None:
++                return idx
++            # pool exhausted inside this update: fall through to the retained region
++        for idx in range(self.retained_slots):
++            if self.vram[idx].key is None:
+                 return idx
+         if self.policy == "lru":
+             # Original reuse-LFU-then-LRU rule (expert_pack.py _victim_slot).
+@@ -173,25 +259,15 @@ class TierPolicy:
+             if best is None:
+                 raise RuntimeError("expert cache cannot evict the active top-k working set")
+             return best
+-        # paper: transient slots first (oldest use), then lowest (access_count, last_access)
+-        transient = [
+-            (e.last_use_step, idx)
+-            for idx, e in enumerate(self.vram)
+-            if not e.retained and e.key not in protected
+-        ]
+-        if transient:
+-            return min(transient)[1]
+-        best = None
+-        for idx, e in enumerate(self.vram):
+-            if e.key in protected:
+-                continue
+-            h = self.history[e.key]
+-            score = (h.access_count, h.last_access, idx)
+-            if best is None or score < best[0]:
+-                best = (score, idx)
+-        if best is None:
++        # paper: transient entries in the retained region first (oldest install),
++        # then the retained entry with the lowest (access_count, last_access, idx)
++        idx = self._fifo_oldest_transient(protected, pool_only=False)
++        if idx is not None and idx < self.retained_slots:
++            return idx
++        idx = self._heap_min_retained(protected)
++        if idx is None:
+             raise RuntimeError("expert cache cannot evict the active top-k working set")
+-        return best[1]
++        return idx
+ 
+     def evict_vram(self, idx: int, *, can_d2h: bool) -> tuple[Optional[Key], str]:
+         """Remove the VRAM entry in ``idx``.
+@@ -209,6 +285,7 @@ class TierPolicy:
+         self.stats.vram_evictions += 1
+         self.key_to_vram.pop(old, None)
+         self.vram_lru.pop(old, None)
++        self._version[idx] += 1  # invalidates any heap entry for this slot
+         e.key, e.retained, e.last_use_step = None, True, -1
+         if old in self.ram_lru:
+             self.ram_lru.move_to_end(old)
+@@ -229,11 +306,15 @@ class TierPolicy:
+         e = self.vram[idx]
+         if e.key is not None:
+             raise RuntimeError("install into an occupied VRAM slot; evict first")
+-        e.key, e.retained, e.last_use_step = key, retained, self.step
++        self._seq += 1
++        e.key, e.retained, e.last_use_step, e.seq = key, retained, self.step, self._seq
+         self.key_to_vram[key] = idx
+         self.vram_lru[key] = None
+-        if not retained:
++        if retained:
++            self._heap_push(idx)
++        else:
+             self.stats.transient_uses += 1
++            self._fifo.append((self._seq, idx))
+ 
+     # -------------------------------------------------------------------- RAM
+     def ram_alloc(
+@@ -279,6 +360,12 @@ class TierPolicy:
+     def check_invariants(self) -> None:
+         s = self.stats
+         assert len(self.key_to_vram) == sum(e.key is not None for e in self.vram)
++        if self.policy == "paper":
++            live = {(self.history[e.key].access_count, self.history[e.key].last_access, i)
++                    for i, e in enumerate(self.vram) if e.key is not None and e.retained}
++            heap_live = {(c, l, i) for c, l, i, v in self._heap if v == self._version[i]
++                         and self.vram[i].key is not None and self.vram[i].retained}
++            assert live == heap_live, "heap out of sync with retained entries"
+         assert set(self.ram_lru.values()).isdisjoint(self.ram_free)
+         assert len(self.ram_lru) + len(self.ram_free) == self.ram_slots
+         assert s.demotions_to_ram == s.demotions_resident + s.demotions_d2h
+diff --git a/python/sglang/srt/model_loader/expert_pack_loader.py b/python/sglang/srt/model_loader/expert_pack_loader.py
+index 23bd070..8925f89 100644
+--- a/python/sglang/srt/model_loader/expert_pack_loader.py
++++ b/python/sglang/srt/model_loader/expert_pack_loader.py
+@@ -260,6 +260,11 @@ class ExpertPackModelLoader(BaseModelLoader):
+                 ),
+                 admission_min_accesses=int(self.config.get("admission_min_accesses", 2)),
+                 admission_window_steps=int(self.config.get("admission_window_steps", 8)),
++                transient_slots=(
++                    int(self.config["transient_slots"])
++                    if self.config.get("transient_slots") is not None
++                    else None
++                ),
+             )
+             weights = deepseek4_nonexpert_weights_iterator(
+                 self.source_path, int(hf_config.num_hidden_layers)
+diff --git a/test/registered/expert_pack/test_expert_pack_tier_gpu.py b/test/registered/expert_pack/test_expert_pack_tier_gpu.py
+index c2b2b13..b36f089 100644
+--- a/test/registered/expert_pack/test_expert_pack_tier_gpu.py
++++ b/test/registered/expert_pack/test_expert_pack_tier_gpu.py
+@@ -26,13 +26,20 @@ def _store(root, **kw):
+ @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+ class TestTieredAcquireGPU(unittest.TestCase):
+     def _run(self, store):
+-        # Force a 1-slot VRAM cache so experts 0 and 1 alternate.
++        # Force a 1-slot retained VRAM cache (plus the configured transient pool)
++        # so experts 0 and 1 alternate.
+         store._cache = None
+         store.initialize_device_cache("cuda")
+-        store._cache = store._cache[:1].clone()
+-        store._cache_slots = store._cache_slots[:1]
++        pool = int(store.stats.get("transient_pool_slots", 0))
++        n = store.stats["cache_capacity_experts"]
++        keep = [0] + list(range(n, n + pool))
++        store._cache = store._cache[keep].clone()
++        store._cache_slots = [store._cache_slots[i] for i in keep]
+         if store._tier is not None:
+-            store._tier.vram = store._tier.vram[:1]
++            tier = store._tier
++            tier.vram = [tier.vram[i] for i in keep]
++            tier._version = [0] * len(keep)
++            tier.retained_slots = 1
+         dev = torch.device("cuda")
+         expected = {0: [0] * 17 + [1] * 17 + [2] * 17, 1: [3] * 17 + [4] * 17 + [5] * 17}
+         seq = [0, 0, 1, 0, 1, 1, 0]
+@@ -48,8 +55,9 @@ class TestTieredAcquireGPU(unittest.TestCase):
+     def test_paper_policy_with_host_cache_counts_and_bytes(self):
+         with tempfile.TemporaryDirectory() as d:
+             s = _store(Path(d), host_cache_mib=1, vram_admission_policy="paper",
+-                       admission_min_accesses=2, admission_window_steps=8)
++                       admission_min_accesses=2, admission_window_steps=8, transient_slots=0)
+             snap = self._run(s)
++        self.assertEqual(snap["transient_pool_slots"], 0)
+         self.assertEqual(snap["cache_hits"], snap["vram_hits"])
+         self.assertEqual(snap["cache_misses"], snap["ram_hits"] + snap["ssd_misses"])
+         self.assertEqual(snap["cache_evictions"], snap["vram_evictions"])
+@@ -73,7 +81,7 @@ class TestTieredAcquireGPU(unittest.TestCase):
+ 
+     def test_paper_policy_without_host_cache(self):
+         with tempfile.TemporaryDirectory() as d:
+-            s = _store(Path(d), vram_admission_policy="paper")
++            s = _store(Path(d), vram_admission_policy="paper", transient_slots=0)
+             self.assertTrue(s.tiered)
+             snap = self._run(s)
+         self.assertEqual(snap["ram_hits"], 0)
+@@ -81,5 +89,23 @@ class TestTieredAcquireGPU(unittest.TestCase):
+         self.assertEqual(snap["host_cache_slots"], 0)
+ 
+ 
++    def test_transient_pool_on_top_of_budget(self):
++        with tempfile.TemporaryDirectory() as d:
++            s = _store(Path(d), host_cache_mib=1, vram_admission_policy="paper",
++                       admission_min_accesses=2, admission_window_steps=8, transient_slots=2)
++            s._cache = None
++            s.initialize_device_cache("cuda")
++            n = s.stats["cache_capacity_experts"]
++            self.assertEqual(s.stats["transient_pool_slots"], 2)
++            self.assertEqual(s._cache.shape[0], n + 2)              # pool is extra rows
++            self.assertEqual(s.stats["cache_capacity_bytes"], n * s.object_payload_bytes)
++            self.assertEqual(s._tier.retained_slots, n)
++            snap = self._run(s)
++        self.assertEqual(snap["cache_hits"], snap["vram_hits"])
++        self.assertEqual(snap["cache_misses"], snap["ram_hits"] + snap["ssd_misses"])
++        self.assertEqual(snap["h2d_bytes"], (snap["ram_hits"] + snap["ssd_misses"]) * s.object_payload_bytes)
++        self.assertGreater(snap["transient_uses"], 0)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/registered/expert_pack/test_expert_pack_tier_policy.py b/test/registered/expert_pack/test_expert_pack_tier_policy.py
+index 0a77af1..1bc2037 100644
+--- a/test/registered/expert_pack/test_expert_pack_tier_policy.py
++++ b/test/registered/expert_pack/test_expert_pack_tier_policy.py
+@@ -39,7 +39,7 @@ class FakeBackend:
+                 continue
+             self.cache_misses += 1
+             retained = p.should_retain(key)  # decided before a slot is freed
+-            idx = p.pick_vram_victim(requested)
++            idx = p.pick_vram_victim(requested, retained=retained)
+             old, result = p.evict_vram(idx, can_d2h=p.ram_slots > 0)
+             if old is not None:
+                 self.cache_evictions += 1
+@@ -55,6 +55,90 @@ class FakeBackend:
+         return outcome
+ 
+ 
++def _reference_victim(p, protected):
++    """Brute-force scan the heap must reproduce exactly (incl. slot-index tie-break)."""
++    best = None
++    for idx, e in enumerate(p.vram):
++        if e.key is None or not e.retained or e.key in protected:
++            continue
++        h = p.history[e.key]
++        score = (h.access_count, h.last_access, idx)
++        if best is None or score < best[0]:
++            best = (score, idx)
++    return None if best is None else best[1]
++
++
++class TestHeapAndPool(unittest.TestCase):
++    def test_heap_victim_equals_full_scan_with_slot_tiebreak(self):
++        rng = random.Random(7)
++        p = TierPolicy(12, 0, policy="paper", admission_min_accesses=2, admission_window_steps=3)
++        for step in range(600):
++            p.begin_step()
++            keys = {(0, rng.randrange(20)) for _ in range(rng.randrange(1, 5))}
++            for k in keys:
++                p.record_access(k)
++            for k in sorted(keys):
++                if p.classify(k) == VRAM:
++                    continue
++                retained = p.should_retain(k)
++                if retained and not p.has_free_vram():
++                    self.assertEqual(p._heap_min_retained(keys), _reference_victim(p, keys))
++                idx = p.pick_vram_victim(keys, retained=retained)
++                p.evict_vram(idx, can_d2h=False)
++                p.install_vram(idx, k, retained=retained)
++            p.check_invariants()  # includes heap <-> retained-set consistency
++        self.assertGreater(p.stats.vram_evictions, 100)
++
++    def test_transient_pool_rotates_fifo_and_leaves_retained_untouched(self):
++        p = TierPolicy(4, 0, policy="paper", transient_slots=3)
++        self.assertEqual(len(p.vram), 7)
++        # fill the retained region with hot experts
++        for _ in range(3):
++            p.begin_step()
++            for k in [(0, 1), (0, 2), (0, 3), (0, 4)]:
++                p.record_access(k)
++                if p.classify(k) != VRAM:
++                    i = p.pick_vram_victim({(0, 1), (0, 2), (0, 3), (0, 4)}, retained=True)
++                    p.install_vram(i, k, retained=True)
++        retained_before = {e.key for e in p.vram[:4]}
++        self.assertFalse(p.has_free_vram())
++        # six cold experts, one per update: pool slots 4,5,6 are used in rotation
++        got = []
++        for e in range(10, 16):
++            p.begin_step(); p.record_access((0, e)); p.classify((0, e))
++            self.assertFalse(p.should_retain((0, e)))
++            i = p.pick_vram_victim({(0, e)}, retained=False)
++            p.evict_vram(i, can_d2h=False); p.install_vram(i, (0, e), retained=False)
++            got.append(i)
++        self.assertEqual(got, [4, 5, 6, 4, 5, 6])
++        self.assertEqual({e.key for e in p.vram[:4]}, retained_before)  # hot set untouched
++        self.assertEqual(p.stats.transient_uses, 6)
++        p.check_invariants()
++
++    def test_pool_exhausted_within_update_falls_back_to_retained_region(self):
++        p = TierPolicy(3, 0, policy="paper", transient_slots=1)
++        for k in [(0, 1), (0, 2), (0, 3)]:
++            p.begin_step(); p.record_access(k); p.classify(k)
++            p.install_vram(p.pick_vram_victim({k}, retained=True), k, retained=True)
++        p.begin_step()
++        req = {(0, 7), (0, 8)}
++        for k in sorted(req):
++            p.record_access(k)
++        slots = []
++        for k in sorted(req):
++            p.classify(k)
++            i = p.pick_vram_victim(req, retained=False)
++            p.evict_vram(i, can_d2h=False); p.install_vram(i, k, retained=False)
++            slots.append(i)
++        self.assertEqual(slots[0], 3)            # pool slot first
++        self.assertLess(slots[1], 3)             # then a retained-region victim (lowest score)
++        p.check_invariants()
++
++    def test_pool_requires_paper_policy(self):
++        with self.assertRaises(ValueError):
++            TierPolicy(2, 0, policy="lru", transient_slots=2)
++
++
+ class TestTierPolicy(unittest.TestCase):
+     def test_lookup_order_vram_then_ram_then_ssd(self):
+         b = FakeBackend(vram=1, ram=4, policy="paper")
+@@ -93,10 +177,12 @@ class TestTierPolicy(unittest.TestCase):
+         self.assertEqual(b.p.vram_slot_of((0, 4)), transient_slot)
+         self.assertEqual(len(b.p.key_to_vram), 2)
+         self.assertTrue({(0, 1), (0, 2)} & set(b.p.key_to_vram))  # a hot expert survived
+-        # 4 accessed again soon -> promoted to retained
+-        b.acquire(0, [4])
+-        self.assertTrue(b.p.vram[b.p.vram_slot_of((0, 4))].retained)
+-        self.assertEqual(b.p.stats.promotions, 1)
++        # 4 hit again in its transient slot: not promoted in place (paper: temporary
++        # slot), but its history now qualifies it for retention on its next load
++        self.assertEqual(b.acquire(0, [4])[(0, 4)], VRAM)
++        self.assertFalse(b.p.vram[b.p.vram_slot_of((0, 4))].retained)
++        self.assertTrue(b.p.should_retain((0, 4)))
++        self.assertEqual(b.p.stats.promotions, 0)
+ 
+     def test_free_vram_always_retains(self):
+         b = FakeBackend(vram=3, ram=0, policy="paper")
+-- 
+2.43.0
+

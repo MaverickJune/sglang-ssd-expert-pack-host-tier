@@ -1,0 +1,51 @@
+[01] alpaca-37246                             ptok=  18 ctok=200 prefill=3.76 decode=3.485 hits=36078 misses=17523 hit_rate=0.673 pack_read=88.61GB disk_read=88.61GB io_err=0 complete=True
+[02] mmlu-abstract_algebra-14                 ptok=  64 ctok=200 prefill=3.71 decode=3.315 hits=28909 misses=26720 hit_rate=0.520 pack_read=103.08GB disk_read=103.12GB io_err=0 complete=True
+[03] alpaca-50812                             ptok=  28 ctok=200 prefill=3.25 decode=3.393 hits=29977 misses=24176 hit_rate=0.554 pack_read=93.67GB disk_read=93.67GB io_err=0 complete=True
+[04] mmlu-moral_disputes-8315                 ptok= 114 ctok= 95 prefill=4.57 decode=2.595 hits=10613 misses=19279 hit_rate=0.355 pack_read=102.03GB disk_read=102.03GB io_err=0 complete=True
+[05] alpaca-9907                              ptok=  25 ctok=122 prefill=3.40 decode=2.987 hits=15839 misses=18298 hit_rate=0.464 pack_read=61.89GB disk_read=61.89GB io_err=0 complete=True
+[06] mmlu-high_school_macroeconomics-3940     ptok= 132 ctok=200 prefill=4.85 decode=2.981 hits=25895 misses=30975 hit_rate=0.455 pack_read=138.08GB disk_read=138.12GB io_err=0 complete=True
+[07] alpaca-40699                             ptok=  24 ctok=200 prefill=3.33 decode=3.430 hits=29930 misses=23974 hit_rate=0.555 pack_read=79.28GB disk_read=79.28GB io_err=0 complete=True
+[08] mmlu-professional_law-10971              ptok= 287 ctok=200 prefill=5.75 decode=2.990 hits=24991 misses=33309 hit_rate=0.429 pack_read=142.64GB disk_read=142.64GB io_err=0 complete=True
+[09] alpaca-34440                             ptok=  30 ctok=200 prefill=3.66 decode=3.166 hits=28366 misses=25948 hit_rate=0.522 pack_read=87.06GB disk_read=87.06GB io_err=0 complete=True
+[10] mmlu-jurisprudence-6660                  ptok=  70 ctok=200 prefill=4.26 decode=3.055 hits=25015 misses=30853 hit_rate=0.448 pack_read=96.50GB disk_read=96.50GB io_err=0 complete=True
+{
+  "label": "E3_paper_host33g",
+  "n": 10,
+  "sum": {
+    "cache_hits": 255613,
+    "cache_misses": 251055,
+    "cache_evictions": 251055,
+    "pack_reads": 74262,
+    "pack_read_bytes": 992834224128,
+    "pack_read_ns": 493067733545,
+    "h2d_bytes": 3356440657920,
+    "io_errors": 0,
+    "fallback_count": 0,
+    "miss_pagecache_resident": 0,
+    "miss_pagecache_partial": 0,
+    "miss_pagecache_absent": 0,
+    "miss_pagecache_resident_ns": 0,
+    "miss_pagecache_absent_ns": 0,
+    "miss_pagecache_resident_bytes": 0,
+    "vram_hits": 255613,
+    "ram_hits": 176793,
+    "ssd_misses": 74262,
+    "vram_evictions": 251055,
+    "demotions_to_ram": 246730,
+    "demotions_resident": 246730,
+    "demotions_d2h": 0,
+    "demotions_discarded": 4325,
+    "ram_evictions": 73572,
+    "transient_uses": 144002,
+    "promotions": 0,
+    "demotion_d2h_bytes": 0
+  },
+  "mean_prefill_tok_s": 4.053912453570896,
+  "mean_decode_tok_s": 3.139717577686108,
+  "diskstats_read_bytes_total": 992916017152,
+  "alpaca_mean_prefill_tok_s": 3.479328725497158,
+  "alpaca_mean_decode_tok_s": 3.292186724652601,
+  "mmlu_mean_prefill_tok_s": 4.628496181644633,
+  "mmlu_mean_decode_tok_s": 2.9872484307196148,
+  "aggregate_hit_rate": 0.5044980144789093
+}

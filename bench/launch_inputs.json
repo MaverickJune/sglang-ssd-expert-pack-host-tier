@@ -1,0 +1,15 @@
+{
+  "artifact_dir": "/root/.cache/sglang-expert-pack/deepseek-v4-flash/87d1fbae3308fd145a1d",
+  "model_meta": "/root/.cache/sglang-expert-pack/deepseek-v4-flash/87d1fbae3308fd145a1d/model-meta",
+  "pack_path": "/opt/ep/models/deepseek-v4-flash-0731/DeepSeek-V4-Flash.expert-pack",
+  "manifest_path": "/opt/ep/models/deepseek-v4-flash-0731/DeepSeek-V4-Flash.expert-pack.manifest.json",
+  "source_path": "/opt/ep/models/deepseek-v4-flash-0731/deepseek-v4-flash-0731.gguf",
+  "source_sha256": "947ac34c08c0e5c5752ac76398f934b3b6b4075cfe915ba43dd5ac754900a4cd",
+  "model_identity_sha256": "ea2a5c416392fc8226337db0393de74618fb23c0e9210e6ed66eb24e21bb6810",
+  "config_sha256": "352c1bbf40d9e535a4e26c1e12cc79c3107f47a9253d13ed73386f038420803e",
+  "pack_size": 147180572672,
+  "object_stride": 13369344,
+  "num_layers": 43,
+  "num_routed_experts": 256,
+  "top_k": 6
+}

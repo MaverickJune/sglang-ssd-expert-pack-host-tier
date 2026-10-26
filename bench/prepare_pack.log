@@ -1,0 +1,67 @@
+artifact_dir=/root/.cache/sglang-expert-pack/deepseek-v4-flash/87d1fbae3308fd145a1d
+model_config=/root/.cache/sglang-expert-pack/deepseek-v4-flash/87d1fbae3308fd145a1d/model-meta/config.json
++ /opt/ep/venv/bin/python /opt/ep/sglang/python/sglang/srt/model_loader/expert_pack/prepare_deepseek_pack.py --gguf /opt/ep/models/deepseek-v4-flash-0731/deepseek-v4-flash-0731.gguf --model-config /root/.cache/sglang-expert-pack/deepseek-v4-flash/87d1fbae3308fd145a1d/model-meta/config.json --safety-margin-gib 16.0
+EXPERT_PACK_INVALID path=/opt/ep/models/deepseek-v4-flash-0731/DeepSeek-V4-Flash.expert-pack detail=[Errno 2] No such file or directory: '/opt/ep/models/deepseek-v4-flash-0731/DeepSeek-V4-Flash.expert-pack'
+EXPERT_PACK_BUILD_START output=/opt/ep/models/deepseek-v4-flash-0731/DeepSeek-V4-Flash.expert-pack resume=false
+completed layer 0/42: pack_end=3433385984
+completed layer 1/42: pack_end=6855938048
+completed layer 2/42: pack_end=10278490112
+completed layer 3/42: pack_end=13701042176
+completed layer 4/42: pack_end=17123594240
+completed layer 5/42: pack_end=20546146304
+completed layer 6/42: pack_end=23968698368
+completed layer 7/42: pack_end=27391250432
+completed layer 8/42: pack_end=30813802496
+completed layer 9/42: pack_end=34236354560
+completed layer 10/42: pack_end=37658906624
+completed layer 11/42: pack_end=41081458688
+completed layer 12/42: pack_end=44504010752
+completed layer 13/42: pack_end=47926562816
+completed layer 14/42: pack_end=51349114880
+completed layer 15/42: pack_end=54771666944
+completed layer 16/42: pack_end=58194219008
+completed layer 17/42: pack_end=61616771072
+completed layer 18/42: pack_end=65039323136
+completed layer 19/42: pack_end=68461875200
+completed layer 20/42: pack_end=71884427264
+completed layer 21/42: pack_end=75306979328
+completed layer 22/42: pack_end=78729531392
+completed layer 23/42: pack_end=82152083456
+completed layer 24/42: pack_end=85574635520
+completed layer 25/42: pack_end=88997187584
+completed layer 26/42: pack_end=92419739648
+completed layer 27/42: pack_end=95842291712
+completed layer 28/42: pack_end=99264843776
+completed layer 29/42: pack_end=102687395840
+completed layer 30/42: pack_end=106109947904
+completed layer 31/42: pack_end=109532499968
+completed layer 32/42: pack_end=112955052032
+completed layer 33/42: pack_end=116377604096
+completed layer 34/42: pack_end=119800156160
+completed layer 35/42: pack_end=123222708224
+completed layer 36/42: pack_end=126645260288
+completed layer 37/42: pack_end=130067812352
+completed layer 38/42: pack_end=133490364416
+completed layer 39/42: pack_end=136912916480
+completed layer 40/42: pack_end=140335468544
+completed layer 41/42: pack_end=143758020608
+completed layer 42/42: pack_end=147180572672
+{"entries": 33024, "manifest": "/opt/ep/models/deepseek-v4-flash-0731/DeepSeek-V4-Flash.expert-pack.manifest.json", "objects": 11008, "pack": "/opt/ep/models/deepseek-v4-flash-0731/DeepSeek-V4-Flash.expert-pack", "pack_sha256": "34b0b5b3867674efde0a4c4e5d7d6524764f728e3b067bc09769bbb96ceed3fa", "pack_size": 147180572672}
+EXPERT_PACK_BUILD_COMPLETE output=/opt/ep/models/deepseek-v4-flash-0731/DeepSeek-V4-Flash.expert-pack
+EXPERT_PACK_READY path=/opt/ep/models/deepseek-v4-flash-0731/DeepSeek-V4-Flash.expert-pack detail=header, index, source path and sizes are valid
+{
+  "artifact_dir": "/root/.cache/sglang-expert-pack/deepseek-v4-flash/87d1fbae3308fd145a1d",
+  "model_meta": "/root/.cache/sglang-expert-pack/deepseek-v4-flash/87d1fbae3308fd145a1d/model-meta",
+  "pack_path": "/opt/ep/models/deepseek-v4-flash-0731/DeepSeek-V4-Flash.expert-pack",
+  "manifest_path": "/opt/ep/models/deepseek-v4-flash-0731/DeepSeek-V4-Flash.expert-pack.manifest.json",
+  "source_path": "/opt/ep/models/deepseek-v4-flash-0731/deepseek-v4-flash-0731.gguf",
+  "source_sha256": "947ac34c08c0e5c5752ac76398f934b3b6b4075cfe915ba43dd5ac754900a4cd",
+  "model_identity_sha256": "ea2a5c416392fc8226337db0393de74618fb23c0e9210e6ed66eb24e21bb6810",
+  "config_sha256": "352c1bbf40d9e535a4e26c1e12cc79c3107f47a9253d13ed73386f038420803e",
+  "pack_size": 147180572672,
+  "object_stride": 13369344,
+  "num_layers": 43,
+  "num_routed_experts": 256,
+  "top_k": 6
+}
+exit=0

@@ -1,0 +1,39 @@
+[01] alpaca-37246                             ptok=  18 ctok=200 prefill=2.63 decode=1.879 hits=30199 misses=23402 hit_rate=0.563 pack_read=312.87GB disk_read=312.87GB io_err=0 complete=True
+[02] mmlu-abstract_algebra-14                 ptok=  64 ctok=200 prefill=3.70 decode=1.637 hits=23995 misses=31634 hit_rate=0.431 pack_read=422.93GB disk_read=422.93GB io_err=0 complete=True
+[03] alpaca-50812                             ptok=  28 ctok=200 prefill=3.05 decode=1.965 hits=31893 misses=22260 hit_rate=0.589 pack_read=297.60GB disk_read=297.60GB io_err=0 complete=True
+[04] mmlu-moral_disputes-8315                 ptok= 114 ctok= 95 prefill=4.43 decode=1.723 hits=13269 misses=16623 hit_rate=0.444 pack_read=222.24GB disk_read=222.24GB io_err=0 complete=True
+[05] alpaca-9907                              ptok=  25 ctok=122 prefill=2.89 decode=1.732 hits=16449 misses=17688 hit_rate=0.482 pack_read=236.48GB disk_read=236.48GB io_err=0 complete=True
+[06] mmlu-high_school_macroeconomics-3940     ptok= 132 ctok=200 prefill=4.66 decode=1.782 hits=28289 misses=28581 hit_rate=0.497 pack_read=382.11GB disk_read=382.11GB io_err=0 complete=True
+[07] alpaca-40699                             ptok=  24 ctok=200 prefill=2.97 decode=1.934 hits=31320 misses=22584 hit_rate=0.581 pack_read=301.93GB disk_read=301.93GB io_err=0 complete=True
+[08] mmlu-professional_law-10971              ptok= 287 ctok=200 prefill=22.21 decode=1.757 hits=26978 misses=27111 hit_rate=0.499 pack_read=362.46GB disk_read=362.46GB io_err=0 complete=False
+[09] alpaca-34440                             ptok=  30 ctok=200 prefill=3.09 decode=1.872 hits=29899 misses=24415 hit_rate=0.550 pack_read=326.41GB disk_read=326.41GB io_err=0 complete=True
+[10] mmlu-jurisprudence-6660                  ptok=  70 ctok=200 prefill=3.85 decode=1.715 hits=27045 misses=28823 hit_rate=0.484 pack_read=385.34GB disk_read=385.43GB io_err=0 complete=True
+{
+  "label": "A_directio_true_pass2",
+  "n": 10,
+  "sum": {
+    "cache_hits": 259336,
+    "cache_misses": 243121,
+    "cache_evictions": 243121,
+    "pack_reads": 243121,
+    "pack_read_bytes": 3250368282624,
+    "pack_read_ns": 1182273018120,
+    "h2d_bytes": 3250368282624,
+    "io_errors": 0,
+    "fallback_count": 0,
+    "miss_pagecache_resident": 96659,
+    "miss_pagecache_partial": 78,
+    "miss_pagecache_absent": 146384,
+    "miss_pagecache_resident_ns": 451974413793,
+    "miss_pagecache_absent_ns": 730116494488,
+    "miss_pagecache_resident_bytes": 1292546678784
+  },
+  "mean_prefill_tok_s": 5.347982189202556,
+  "mean_decode_tok_s": 1.7996267009837439,
+  "diskstats_read_bytes_total": 3250453168128,
+  "alpaca_mean_prefill_tok_s": 2.9264299723408316,
+  "alpaca_mean_decode_tok_s": 1.8763196942311793,
+  "mmlu_mean_prefill_tok_s": 7.769534406064279,
+  "mmlu_mean_decode_tok_s": 1.7229337077363085,
+  "aggregate_hit_rate": 0.516135709125358
+}
