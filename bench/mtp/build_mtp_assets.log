@@ -1,0 +1,30 @@
+experts gate: HF w1 rows=2048 cols=4096 bytes/expert=2176
+experts up: HF w3 rows=2048 cols=4096 bytes/expert=2176
+experts down: HF w2 rows=4096 cols=2048 bytes/expert=1088
+gguf /opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.gguf sha256=a00be5a52454def2616650280b313b87656d532b9b4e9b18dc424495843af6b8 size=3422552480
+dense Q8_0 mtp.0.attn.wkv.weight shape=[512, 4096] max_rel_err=3.81e-03
+dense Q8_0 mtp.0.attn.wo_a.weight shape=[8192, 4096] max_rel_err=3.74e-03
+dense Q8_0 mtp.0.attn.wo_b.weight shape=[4096, 8192] max_rel_err=3.91e-03
+dense Q8_0 mtp.0.attn.wq_a.weight shape=[1024, 4096] max_rel_err=3.65e-03
+dense Q8_0 mtp.0.attn.wq_b.weight shape=[32768, 1024] max_rel_err=3.91e-03
+dense Q8_0 mtp.0.e_proj.weight shape=[4096, 4096] max_rel_err=3.91e-03
+dense Q8_0 mtp.0.ffn.shared_experts.w1.weight shape=[2048, 4096] max_rel_err=3.72e-03
+dense Q8_0 mtp.0.ffn.shared_experts.w2.weight shape=[4096, 2048] max_rel_err=3.90e-03
+dense Q8_0 mtp.0.ffn.shared_experts.w3.weight shape=[2048, 4096] max_rel_err=3.90e-03
+dense Q8_0 mtp.0.h_proj.weight shape=[4096, 4096] max_rel_err=3.91e-03
+dense tensors: 39 -> /opt/ep/models/deepseek-v4-flash-mtp/mtp-dense.safetensors
++ /opt/ep/venv/bin/python /opt/ep/sglang/python/sglang/srt/model_loader/expert_pack/build.py --source /opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.gguf --source-sha256 a00be5a52454def2616650280b313b87656d532b9b4e9b18dc424495843af6b8 --output /opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.expert-pack --manifest /opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.expert-pack.manifest.json --checkpoint /opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.expert-pack.checkpoint.json --model-ref deepseek-v4-flash-mtp --model-identity-sha256 0748b0e3390e833081013ea0df649dcf76c8fe451dd7204623a9ce77f339aba3 --config-blob /opt/ep/models/deepseek-v4-flash-mtp/config.json --config-sha256 352c1bbf40d9e535a4e26c1e12cc79c3107f47a9253d13ed73386f038420803e --num-layers 1 --num-experts 256 --top-k 6 --alignment 4096 --safety-margin-gib 1
+completed layer 0/0: pack_end=3422806016
+{"entries": 768, "manifest": "/opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.expert-pack.manifest.json", "objects": 256, "pack": "/opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.expert-pack", "pack_sha256": "6ca2de41cc52e90951f0554e9578ce71f594d04ad29e718e89010b88bf7f6179", "pack_size": 3422806016}
+{
+  "draft_dir": "/opt/ep/models/deepseek-v4-flash-mtp",
+  "mtp_gguf": "/opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.gguf",
+  "mtp_gguf_sha256": "a00be5a52454def2616650280b313b87656d532b9b4e9b18dc424495843af6b8",
+  "mtp_pack_path": "/opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.expert-pack",
+  "mtp_manifest_path": "/opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.expert-pack.manifest.json",
+  "mtp_dense_path": "/opt/ep/models/deepseek-v4-flash-mtp/mtp-dense.safetensors",
+  "config_sha256": "352c1bbf40d9e535a4e26c1e12cc79c3107f47a9253d13ed73386f038420803e",
+  "model_identity_sha256": "0748b0e3390e833081013ea0df649dcf76c8fe451dd7204623a9ce77f339aba3",
+  "source_shard": "/opt/ep/models/deepseek-v4-flash-hf-mtp/model-00046-of-00046.safetensors",
+  "source_shard_sha256": "f58f722893a6148216a2155cee4a57fe691cea4d3b323135c433a936b932055d"
+}

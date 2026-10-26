@@ -1,7 +1,7 @@
 From 8a3bd9e761c200e270a89d4cb8b7ebf7de0055f9 Mon Sep 17 00:00:00 2001
 From: bench <bench@local>
 Date: Mon, 26 Oct 2026 18:20:52 +0000
-Subject: [PATCH 6/6] expert_pack: per-source (RAM/SSD) prefetch readiness and
+Subject: [PATCH 6/7] expert_pack: per-source (RAM/SSD) prefetch readiness and
  wait counters
 
 Adds prefetch_used_{ready,waited}_{ram,ssd}, prefetch_wait_ns_{ram,ssd},

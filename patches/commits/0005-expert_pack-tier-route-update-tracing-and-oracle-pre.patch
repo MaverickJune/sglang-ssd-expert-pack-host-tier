@@ -1,7 +1,7 @@
 From 77d19970a6100806cc48daeed034aa51ca5fdba7 Mon Sep 17 00:00:00 2001
 From: bench <bench@local>
 Date: Mon, 26 Oct 2026 16:49:22 +0000
-Subject: [PATCH 5/6] expert_pack tier: route/update tracing and oracle
+Subject: [PATCH 5/7] expert_pack tier: route/update tracing and oracle
  prefetch (prefetch_depth) for latency-hiding experiments
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

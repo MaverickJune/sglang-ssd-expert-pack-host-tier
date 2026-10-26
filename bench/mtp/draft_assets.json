@@ -1,0 +1,12 @@
+{
+  "draft_dir": "/opt/ep/models/deepseek-v4-flash-mtp",
+  "mtp_gguf": "/opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.gguf",
+  "mtp_gguf_sha256": "a00be5a52454def2616650280b313b87656d532b9b4e9b18dc424495843af6b8",
+  "mtp_pack_path": "/opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.expert-pack",
+  "mtp_manifest_path": "/opt/ep/models/deepseek-v4-flash-mtp/DeepSeek-V4-Flash-MTP.expert-pack.manifest.json",
+  "mtp_dense_path": "/opt/ep/models/deepseek-v4-flash-mtp/mtp-dense.safetensors",
+  "config_sha256": "352c1bbf40d9e535a4e26c1e12cc79c3107f47a9253d13ed73386f038420803e",
+  "model_identity_sha256": "0748b0e3390e833081013ea0df649dcf76c8fe451dd7204623a9ce77f339aba3",
+  "source_shard": "/opt/ep/models/deepseek-v4-flash-hf-mtp/model-00046-of-00046.safetensors",
+  "source_shard_sha256": "f58f722893a6148216a2155cee4a57fe691cea4d3b323135c433a936b932055d"
+}

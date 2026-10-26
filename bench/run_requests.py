@@ -126,6 +126,7 @@ def generate(url: str, prompt: str, max_new_tokens: int, timeout: float) -> dict
     cached_tokens = 0
     output = ""
     finish = None
+    spec_meta = {}
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             now = time.perf_counter_ns()
@@ -148,6 +149,10 @@ def generate(url: str, prompt: str, max_new_tokens: int, timeout: float) -> dict
             if ev.get("text") is not None:
                 output = ev["text"]
             finish = meta.get("finish_reason", finish)
+            for key in ("spec_accept_rate", "spec_accept_length", "spec_verify_ct",
+                        "spec_num_correct_drafts", "spec_num_proposed_drafts", "e2e_latency"):
+                if meta.get(key) is not None:
+                    spec_meta[key] = meta[key]
     total_s = (time.perf_counter_ns() - started) / 1e9
     ttft_s = (first - started) / 1e9
     decode_span = (last - first) / 1e9
@@ -155,7 +160,7 @@ def generate(url: str, prompt: str, max_new_tokens: int, timeout: float) -> dict
     return {
         "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
         "cached_tokens": cached_tokens,  # radix prefix-cache hits: these prompt tokens are not re-forwarded
-        "finish_reason": finish, "output": output, "ttft_s": ttft_s,
+        "finish_reason": finish, "output": output, "ttft_s": ttft_s, "spec": spec_meta,
         "prefill_tok_s": prompt_tokens / ttft_s if ttft_s > 0 else None,
         "decode_tok_s": intervals / decode_span if decode_span > 0 else None,
         "total_s": total_s,

@@ -267,8 +267,9 @@ def _initialize_runtime_state(
     store._transfer_stream = None
     store._read_executor = None
     store._active_keys = set()
-    store._route_calls_by_layer = [0] * store.header.num_layers
-    store._route_tokens_by_layer = [0] * store.header.num_layers
+    layer_slots = store.header.num_layers + (1 if getattr(store, "mtp_layer_id", None) is not None else 0)
+    store._route_calls_by_layer = [0] * layer_slots
+    store._route_tokens_by_layer = [0] * layer_slots
     store.stats_path = Path(stats_path).resolve() if stats_path else None
     store._last_stats_flush_calls = 0
     store.stats = {
@@ -358,6 +359,11 @@ def _initialize_runtime_state(
 class ExpertPackStore:
     """Validated pack index plus generation-aware GPU and host caches."""
 
+    # Defaults for subclasses that bypass __init__ (Kimi): no MTP pack attached.
+    mtp_layer_id: int | None = None
+    _fd_by_layer: dict[int, int] = {}
+    decode_token_threshold: int = 1
+
     def __init__(
         self,
         pack_path: str | os.PathLike[str],
@@ -388,7 +394,11 @@ class ExpertPackStore:
         prefetch_trace_path: str | os.PathLike[str] | None = None,
         prefetch_depth: int = 0,
         prefetch_max_inflight: int = 256,
+        mtp_pack_path: str | os.PathLike[str] | None = None,
+        mtp_manifest_path: str | os.PathLike[str] | None = None,
+        decode_token_threshold: int = 1,
     ) -> None:
+        self.decode_token_threshold = max(1, int(decode_token_threshold))
         self.path = Path(pack_path).resolve()
         self.manifest_path = Path(
             manifest_path or str(self.path) + ".manifest.json"
@@ -488,6 +498,14 @@ class ExpertPackStore:
             role: role_id * self.role_bytes for role_id, role in enumerate(ROLE_NAMES)
         }
         self.role_nbytes = {role: self.role_bytes for role in ROLE_NAMES}
+        # Optional second pack holding the MTP (NextN) draft layer's routed experts.
+        # It is addressed as logical layer `num_layers` (43 for V4-Flash) so the
+        # draft's FusedMoE shares this store's VRAM/RAM caches and tier policy.
+        self.mtp_layer_id: int | None = None
+        self._fd_by_layer: dict[int, int] = {}
+        self._mtp_direct_io = bool(direct_io)
+        if mtp_pack_path is not None:
+            self._attach_mtp_pack(mtp_pack_path, mtp_manifest_path)
         _initialize_runtime_state(
             self,
             cache_vram_mib=cache_vram_mib,
@@ -602,6 +620,67 @@ class ExpertPackStore:
             layer, expert, staging, start=0, length=self.object_payload_bytes
         )
 
+    def _attach_mtp_pack(
+        self,
+        mtp_pack_path: str | os.PathLike[str],
+        mtp_manifest_path: str | os.PathLike[str] | None,
+    ) -> None:
+        """Index a 1-layer pack (the MTP draft layer) as logical layer num_layers."""
+        path = Path(mtp_pack_path).resolve()
+        manifest_path = Path(mtp_manifest_path or str(path) + ".manifest.json").resolve()
+        if not path.is_file() or not manifest_path.is_file():
+            raise FileNotFoundError(f"MTP expert-pack or manifest is missing: {path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not manifest.get("complete"):
+            raise ValueError("MTP expert-pack manifest is not complete")
+        with path.open("rb", buffering=0) as stream:
+            header = ExpertPackHeader.read(stream)
+            entries = [ExpertPackEntry.read(stream) for _ in range(header.index_count)]
+        if (header.num_layers, header.num_experts, header.top_k) != (
+            1, self.header.num_experts, self.header.top_k
+        ):
+            raise ValueError(
+                "MTP expert-pack must hold exactly one layer with the main pack's "
+                f"expert count and top-k, got {(header.num_layers, header.num_experts, header.top_k)}"
+            )
+        if int(manifest["object_stride"]) != self.object_stride:
+            raise ValueError("MTP expert-pack object stride differs from the main pack")
+        layer_id = self.header.num_layers
+        role_bytes = None
+        for entry in entries:
+            if entry.layer != 0:
+                raise ValueError("MTP expert-pack entry is not on layer 0")
+            if entry.dtype != "MXFP4" or entry.transform_id != "identity-v1" or entry.block_size != 32:
+                raise ValueError("MTP expert-pack entry is not identity MXFP4")
+            if role_bytes is None:
+                role_bytes = entry.pack_nbytes
+            elif role_bytes != entry.pack_nbytes:
+                raise ValueError("MTP expert-pack roles are not fixed size")
+            key = (layer_id, entry.expert, entry.role_id)
+            if key in self.entries:
+                raise ValueError(f"duplicate MTP expert-pack entry {key}")
+            self.entries[key] = entry
+        if role_bytes != self.role_bytes:
+            raise ValueError(
+                f"MTP expert-pack role bytes {role_bytes} != main pack {self.role_bytes}"
+            )
+        expected_size = header.data_start + header.num_experts * self.object_stride
+        if path.stat().st_size != expected_size:
+            raise ValueError("MTP expert-pack file size does not match its index")
+        for expert in range(header.num_experts):
+            object_offset = header.data_start + expert * self.object_stride
+            self.object_offsets[(layer_id, expert)] = object_offset
+            for role_id in range(len(ROLE_NAMES)):
+                entry = self.entries[(layer_id, expert, role_id)]
+                if entry.pack_offset != object_offset + role_id * role_bytes:
+                    raise ValueError(f"MTP expert-pack layout mismatch at {(expert, role_id)}")
+        open_flags = os.O_RDONLY | (os.O_DIRECT if self._mtp_direct_io else 0)
+        self._fd_by_layer[layer_id] = os.open(path, open_flags)
+        self.mtp_layer_id = layer_id
+        self.mtp_pack_path = path
+        self.mtp_pack_sha256 = str(manifest.get("pack_sha256"))
+        self.active_moe_layer_ids = frozenset(self.active_moe_layer_ids | {layer_id})
+
     def _read_object_range(
         self,
         layer: int,
@@ -618,7 +697,7 @@ class ExpertPackStore:
         offset = object_offset + start
         view = memoryview(staging.numpy()).cast("B")[start : start + length]
         started = time.perf_counter_ns()
-        read_bytes = os.preadv(self._fd, [view], offset)
+        read_bytes = os.preadv(self._fd_by_layer.get(layer, self._fd), [view], offset)
         elapsed = time.perf_counter_ns() - started
         if read_bytes != length:
             raise OSError(
@@ -679,8 +758,10 @@ class ExpertPackStore:
 
     def _probe_residency(self, layer: int, expert: int) -> tuple[int, int]:
         """Return (resident_bytes, total_bytes) of one object in the page cache."""
-        start = self.object_offsets[(layer, expert)]
         length = self.object_payload_bytes
+        if layer in self._fd_by_layer:
+            return 0, length  # MTP pack is not mapped for the probe; count as absent
+        start = self.object_offsets[(layer, expert)]
         page = self._page
         aligned = start - (start % page)
         span = (start + length - aligned + page - 1) // page * page
@@ -728,7 +809,9 @@ class ExpertPackStore:
                 f"received shape {tuple(topk_ids.shape)}"
             )
         if is_prefill is None:
-            is_prefill = topk_ids.shape[0] > 1
+            # Updates with at most decode_token_threshold rows are decode-like;
+            # speculative verify (num_draft_tokens rows) must not look like prefill.
+            is_prefill = topk_ids.shape[0] > self.decode_token_threshold
         if self.tiered:
             return self._acquire_tiered(layer, topk_ids, is_prefill=is_prefill)
         route_ids = [int(value) for value in topk_ids.detach().cpu().reshape(-1)]
@@ -1387,6 +1470,9 @@ class ExpertPackStore:
         if getattr(self, "_fd", -1) >= 0:
             os.close(self._fd)
             self._fd = -1
+        for layer, fd in list(getattr(self, "_fd_by_layer", {}).items()):
+            os.close(fd)
+            self._fd_by_layer.pop(layer, None)
         if getattr(self, "_probe_map", None) is not None:
             self._libc.munmap(ctypes.c_void_p(self._probe_map), self._probe_len)
             os.close(self._probe_fd)

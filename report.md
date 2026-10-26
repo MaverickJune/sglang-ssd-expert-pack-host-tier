@@ -704,3 +704,61 @@ Sweep 1 (commit `77d1997`, aggregate counters only, same configs plus k = 8) agr
 * **Throughput effect (same 5 prompts, byte-identical outputs in all 19 runs):** SSD regime TPOT 516 ms (k = 0) → 297 (k=1) → 256 (k=2) → 244 (k=3, 4) → 234–237 (k=6, 8). RAM regime 323 → 255–265 (k=1) → 206–234 (k=2) → 204–211 (k=3, 4). Run-to-run noise between identical passes is ≈ ±20–30 ms, so differences beyond k = 2 (SSD) / k = 2 (RAM) are within noise except for the trend. Note that with oracle prefetch the SSD regime (4 GiB host cache) reaches the same TPOT as the RAM regime at k ≥ 3 — with an oracle, the host tier's value shifts from latency hiding to reducing NVMe traffic (1.07 TB vs 0.45 TB read per pass).
 * **Caveats.** (i) This is an *oracle* prefetch: the routing is known from a recorded trace, so the depth measured here is the pure transfer-latency requirement; a real predictor adds its own look-ahead error and would have to fetch more candidates per layer. (ii) Concurrency 1, 5 prompts, 200 tokens; with batching the per-layer compute gap grows and the required k shrinks. (iii) The pinned RAM footprint of in-flight prefetches is k × 6 slots (≤ 0.6 GiB at k = 8), which the 4 GiB transit pool absorbed without backpressure (`prefetch_skipped_inflight` = 0 in all SSD runs; 21 and 1 508 in the RAM-regime k = 4 / k = 8 runs from the 512 in-flight cap during prefill).
 
+
+---
+
+# Part 4 — MTP (NextN) speculative decoding on the Expert Pack
+
+## 16. Making DeepSeek-V4-Flash's MTP head usable under `--load-format expert_pack`
+
+### 16.1 What was missing
+
+The Ollama MXFP4 GGUF that the Expert Pack is built from carries 43 decoder layers and **no MTP tensors** (`block_count=43`, no `blk.43.*`, `eh_proj`, `enorm`, `hnorm`, `shared_head`); the `num_nextn_predict_layers: 1` in the synthesized config is a constant in `expert_pack_runtime.py`, not a fact about the weights. SGLang itself has the draft model (`DeepseekV4ForCausalLMNextN`) and runs DeepSeek-V4 MTP through its EAGLE worker, but the expert-pack loader had no draft path, and the KV-compressor state handling needed for speculative verify is attention-side code the pack never touches (§ answer in chat: ring widening for ratio-4/128 compressors, explicit bank/commit only in the experimental online-c128 mode).
+
+### 16.2 Weights: HF shard 46 → lossless MXFP4 repack + Q8_0 dense
+
+* Downloaded `deepseek-ai/DeepSeek-V4-Flash` shard `model-00046-of-00046.safetensors` (3.59 GB, sha256 `f58f7228…`); it holds all 1,575 `mtp.0.*` tensors: 256 routed experts (`w1/w3/w2` as **int8-packed fp4** `[2048,2048]`/`[4096,1024]` with `F8_E8M0` scales `[rows, cols/32]`), fp8-e4m3 block-128 dense linears with e8m0 scales, bf16/f32 norms, gate, hyper-connection parameters.
+* **Experts are not requantized.** HF fp4 is e2m1 with one e8m0 scale per 32 elements, exactly MXFP4's number system; the only difference is nibble order (HF packs elements 2j,2j+1 per byte; GGUF MXFP4 packs j and j+16). `bench/mtp/build_mtp_assets.py` repacks and asserts bit-exact dequantized equality for expert 0. (Side finding: Ollama's GGUF experts are *not* bit-identical to the HF fp4 — 2.8 % of block scales differ by ±1 and 13 % of elements differ by one quantization step — so the MTP layer served here is slightly *more* faithful to the released weights than the 43 target layers.)
+* The repacked experts go into a mini GGUF (`blk.0.ffn_{gate,up,down}_exps.weight`, MXFP4, 3.42 GB) from which the **stock pack builder** (`expert_pack/build.py`, `--num-layers 1`) produces `DeepSeek-V4-Flash-MTP.expert-pack` (same object stride 13,369,344 B, same role bytes, own manifest/checkpoint/sha).
+* Dense MTP tensors (wq_a/wq_b/wkv/wo_a/wo_b, shared expert w1/w3/w2, e_proj/h_proj) are dequantized from fp8 and quantized to **GGUF Q8_0** — the same type the target's dense GGUF weights use — max relative round-trip error 0.37–0.39 %; norms/gate/hc/sink pass through. Saved as `mtp-dense.safetensors` (181.6 MB) with HF names (`mtp.0.*`), plus a copy of the target's config/tokenizer, in `/opt/ep/models/deepseek-v4-flash-mtp/` (`draft_assets.json` has every path and digest).
+
+### 16.3 Runtime changes (commit `5604f50`, +1 test file; 31 tests pass)
+
+| where | change |
+|---|---|
+| `ExpertPackStore` | `mtp_pack_path` / `mtp_manifest_path`: a 1-layer pack is validated (1 layer, same expert count/top-k/stride/role bytes/size, identity MXFP4) and indexed as **logical layer 43**; it is read through its own fd (`_fd_by_layer`), closed with the store, excluded from the mincore probe; per-layer stat arrays grow by one. Everything else — VRAM slot cache, RAM tier, paper admission, heap victim selection, prefetch — treats `(43, e)` like any other key, so the draft's experts share the target's caches. |
+| `ExpertPackMoEMethod` | the NextN decoder is built with `layer_id=0`; a prefix of `model.decoder.*` maps the FusedMoE to `store.mtp_layer_id` instead of layer 0. |
+| `ExpertPackModelLoader` | `is_draft_model` → `_load_draft_model`: instantiates `DeepseekV4ForCausalLMNextN` with an `ExpertPackConfig` on the **target's registered store**, loads the Q8_0 dense tensors (`.qweight_type` before `.qweight`, as the GGUF iterator does), then **shares the target's GGUF embedding and lm_head modules** (the EAGLE worker's `get_/set_embed_and_head` assume a dense `.weight`; they are redirected to the GGUF `qweight`). |
+| `decode_token_threshold` | the store classified any update with >1 token as prefill (affects victim order and prefetch); speculative verify runs `num_draft_tokens` rows per step, so updates with ≤ `decode_token_threshold` rows now count as decode (set to the draft-token count by `run_mtp.sh`). |
+
+No change was needed in attention: the draft runs on the `dsv4` multi-step backend (`DeepseekV4MultiStepBackend`) and the target's verify path, both upstream.
+
+Launch (`bench/mtp/launch_spec.sh`): the usual expert-pack command plus `--speculative-algorithm EAGLE --speculative-draft-model-path /opt/ep/models/deepseek-v4-flash-mtp --speculative-num-steps S --speculative-eagle-topk 1 --speculative-num-draft-tokens S+1`, and `mtp_pack_path`/`mtp_manifest_path`/`decode_token_threshold` in `--model-loader-extra-config`. `cache_vram_mib` was lowered 21504 → 19456 (1614 → 1459 slots) to leave room for the draft (181 MB dense + its 1-layer KV pool: the draft worker reported 1.95 GB available after load); the baselines below use the same 19456.
+
+### 16.4 Results (5 prompts, 200 tokens, concurrency 1, temperature 0, paper policy, transient 24, `direct_io=true`)
+
+| run | host cache | spec (steps / draft tokens) | wall s (5 prompts) | e2e tokens/s | TPOT ms (client) | accept rate | accept length | target steps | SSD misses | RAM hits | pack read GB |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| M0 | 33 GiB | off | 500 | 1.63 | 402 | – | – | 822 | 34,334 | 74,865 | 459 |
+| **M1** | 33 GiB | **1 / 2** | **288** | **2.80** | **284** | 0.833 | 1.84 | 453 | 38,375 | 73,906 | 513 |
+| M2 | 33 GiB | 2 / 3 | 337 | 2.48 | 327 | 0.585 | 2.18 | 400 | 45,602 | 91,168 | 610 |
+| M3 | 33 GiB | 3 / 4 | 387 | 2.06 | 397 | 0.443 | 2.32 | 366 | 50,814 | 105,704 | 679 |
+| S0 | 4 GiB | off | 507 | 1.61 | 544 | – | – | 822 | 82,246 | 26,953 | 1,100 |
+| S1 | 4 GiB | 1 / 2 | 431 | 1.87 | 452 | 0.833 | 1.84 | 453 | 93,287 | 18,994 | 1,247 |
+| S3 | 4 GiB | 3 / 4 | 613 | 1.30 | 674 | 0.443 | 2.32 | 366 | 152,020 | 4,498 | 2,032 |
+
+(`io_errors` = 0 everywhere; "TPOT ms (client)" is the client-side inter-token time, which with speculation measures bursts of 1–4 tokens; "wall s" and "e2e tokens/s" are the honest end-to-end numbers. Raw per-request data incl. `spec_accept_*` from the server's `meta_info`: `bench/mtp/results/<run>/pass1/requests.jsonl`.)
+
+**Per target step** (RAM regime): a non-speculative step needs 144 VRAM hits + 91 RAM hits + 44 SSD misses; with 1 draft step the verify step (2 tokens) plus one draft forward needs 223 + 163 + 89, i.e. ≈ 1.6–2.0× the expert traffic, for 1.84 tokens per step. With 3 draft steps the traffic is ≈ 2.4–3.3× for 2.32 tokens. That ratio is the whole story of the table.
+
+### 16.5 Reading the numbers
+
+* **MTP works end-to-end on the pack.** The draft's acceptance rate is 83 % per proposed token (1.84 accepted tokens per step with one draft step), the range DeepSeek reports for V3-style MTP; the draft layer's 256 experts stream from the MTP pack through the same tiered cache (450 draft forwards per 5 prompts, visible as `route_calls_by_layer[43]`).
+* **With the RAM tier, 1 draft step gives 1.74× end-to-end** (500 → 288 s, 1.63 → 2.80 tokens/s). More draft steps raise the accepted length only a little (1.84 → 2.18 → 2.32) while each extra draft token adds another ~6 experts per layer to the verify step and another draft forward, so 2 and 3 steps are slower than 1 (337 s, 387 s). On this memory-bound system the optimum is the minimum configuration `--speculative-num-steps 1 --speculative-num-draft-tokens 2`.
+* **Without the RAM tier the gain shrinks to 1.18×** (507 → 431 s) and 3 steps become a 21 % *loss* (613 s): every extra verify token costs real NVMe reads (pack read 1.10 → 1.25 → 2.03 TB). Speculative decoding on an SSD-resident MoE needs the host tier to pay for its extra expert traffic.
+* **Outputs are not byte-identical to the non-speculative greedy outputs** (0/5; the common prefix is 230–240 characters ≈ 60 tokens). This is expected, not a bug: with greedy verification the accepted token is the target's argmax *computed in the verify batch* (2–4 rows through the attention/MoE kernels) rather than in the 1-row decode batch, and near-ties flip under bf16/MXFP4 numerics; the two runs then continue from different tokens. The baselines (M0, S0) reproduce the earlier runs byte-for-byte (5/5), the speculative outputs are coherent and reach the same final answers on the checked prompts (same MMLU choice D, same translation), and an 83 % draft hit rate is impossible with broken draft weights. A byte-identical check across spec/non-spec would need a verify kernel path that is bit-reproducible against decode, which SGLang does not promise.
+* **Caveats / not done.** (i) Oracle prefetch (Part 3) was left off in these runs; with speculation the per-step layer sequence is 0…42 (verify) then 43 (draft), so the trace replay would need the draft layer in its schedule. (ii) The target's verify batch is served by the same `mxfp4_matvec` path as prefill; a fused multi-row verify kernel might change the balance. (iii) Concurrency 1 only. (iv) The draft's own 256 experts compete for the same 1459 VRAM slots; a dedicated small resident region for layer 43 (≈ 6 experts/step, 3.3 GB for all 256) was not tried.
+
+### 16.6 Deliverables
+
+`bench/mtp/build_mtp_assets.py` (+ `build_mtp_assets.log`), `launch_spec.sh`, `run_mtp.sh`, `chain_mtp.sh`, `summarize_mtp.py`, `summary.md`, `results/<run>/{pass1/requests.jsonl, stats_*.json, stats_final.json, server.log, update_trace.jsonl}`, draft assets in `/opt/ep/models/deepseek-v4-flash-mtp/` (`draft_assets.json`), code in commit `5604f50` on `expert-pack-host-tier` (`bench/patches/commits/0007-*.patch`).

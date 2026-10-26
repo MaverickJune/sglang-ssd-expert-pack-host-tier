@@ -1,0 +1,465 @@
+From 5604f50ef21f40d4268a6e1103082af2425fbf28 Mon Sep 17 00:00:00 2001
+From: bench <bench@local>
+Date: Mon, 26 Oct 2026 21:03:19 +0000
+Subject: [PATCH 7/7] expert_pack: DeepSeek-V4 MTP (NextN) draft on the shared
+ expert-pack store
+
+- ExpertPackStore: optional 1-layer MTP pack (mtp_pack_path/mtp_manifest_path)
+  indexed as logical layer num_layers, read through its own fd; probe/close aware.
+- ExpertPackMoEMethod: the NextN decoder's FusedMoE (prefix model.decoder.*)
+  maps to the MTP layer id.
+- ExpertPackModelLoader: draft (is_draft_model) path loads
+  DeepseekV4ForCausalLMNextN with the target's store, Q8_0 dense tensors from
+  mtp-dense.safetensors, and shares the target's GGUF embedding/lm_head.
+- decode_token_threshold: speculative verify rows (<= num_draft_tokens) are
+  classified as decode for the tier policy.
+- tests: attached MTP pack read/validation (31 tests pass).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ python/sglang/srt/layers/moe/expert_pack.py   |  96 ++++++++++++++-
+ .../srt/layers/quantization/expert_pack.py    |  19 ++-
+ .../srt/model_loader/expert_pack_loader.py    | 110 ++++++++++++++++++
+ .../expert_pack/test_expert_pack_runtime.py   |  74 ++++++++++++
+ 4 files changed, 290 insertions(+), 9 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/expert_pack.py b/python/sglang/srt/layers/moe/expert_pack.py
+index cfc09c5..b0782d2 100644
+--- a/python/sglang/srt/layers/moe/expert_pack.py
++++ b/python/sglang/srt/layers/moe/expert_pack.py
+@@ -267,8 +267,9 @@ def _initialize_runtime_state(
+     store._transfer_stream = None
+     store._read_executor = None
+     store._active_keys = set()
+-    store._route_calls_by_layer = [0] * store.header.num_layers
+-    store._route_tokens_by_layer = [0] * store.header.num_layers
++    layer_slots = store.header.num_layers + (1 if getattr(store, "mtp_layer_id", None) is not None else 0)
++    store._route_calls_by_layer = [0] * layer_slots
++    store._route_tokens_by_layer = [0] * layer_slots
+     store.stats_path = Path(stats_path).resolve() if stats_path else None
+     store._last_stats_flush_calls = 0
+     store.stats = {
+@@ -358,6 +359,11 @@ def _initialize_runtime_state(
+ class ExpertPackStore:
+     """Validated pack index plus generation-aware GPU and host caches."""
+ 
++    # Defaults for subclasses that bypass __init__ (Kimi): no MTP pack attached.
++    mtp_layer_id: int | None = None
++    _fd_by_layer: dict[int, int] = {}
++    decode_token_threshold: int = 1
++
+     def __init__(
+         self,
+         pack_path: str | os.PathLike[str],
+@@ -388,7 +394,11 @@ class ExpertPackStore:
+         prefetch_trace_path: str | os.PathLike[str] | None = None,
+         prefetch_depth: int = 0,
+         prefetch_max_inflight: int = 256,
++        mtp_pack_path: str | os.PathLike[str] | None = None,
++        mtp_manifest_path: str | os.PathLike[str] | None = None,
++        decode_token_threshold: int = 1,
+     ) -> None:
++        self.decode_token_threshold = max(1, int(decode_token_threshold))
+         self.path = Path(pack_path).resolve()
+         self.manifest_path = Path(
+             manifest_path or str(self.path) + ".manifest.json"
+@@ -488,6 +498,14 @@ class ExpertPackStore:
+             role: role_id * self.role_bytes for role_id, role in enumerate(ROLE_NAMES)
+         }
+         self.role_nbytes = {role: self.role_bytes for role in ROLE_NAMES}
++        # Optional second pack holding the MTP (NextN) draft layer's routed experts.
++        # It is addressed as logical layer `num_layers` (43 for V4-Flash) so the
++        # draft's FusedMoE shares this store's VRAM/RAM caches and tier policy.
++        self.mtp_layer_id: int | None = None
++        self._fd_by_layer: dict[int, int] = {}
++        self._mtp_direct_io = bool(direct_io)
++        if mtp_pack_path is not None:
++            self._attach_mtp_pack(mtp_pack_path, mtp_manifest_path)
+         _initialize_runtime_state(
+             self,
+             cache_vram_mib=cache_vram_mib,
+@@ -602,6 +620,67 @@ class ExpertPackStore:
+             layer, expert, staging, start=0, length=self.object_payload_bytes
+         )
+ 
++    def _attach_mtp_pack(
++        self,
++        mtp_pack_path: str | os.PathLike[str],
++        mtp_manifest_path: str | os.PathLike[str] | None,
++    ) -> None:
++        """Index a 1-layer pack (the MTP draft layer) as logical layer num_layers."""
++        path = Path(mtp_pack_path).resolve()
++        manifest_path = Path(mtp_manifest_path or str(path) + ".manifest.json").resolve()
++        if not path.is_file() or not manifest_path.is_file():
++            raise FileNotFoundError(f"MTP expert-pack or manifest is missing: {path}")
++        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
++        if not manifest.get("complete"):
++            raise ValueError("MTP expert-pack manifest is not complete")
++        with path.open("rb", buffering=0) as stream:
++            header = ExpertPackHeader.read(stream)
++            entries = [ExpertPackEntry.read(stream) for _ in range(header.index_count)]
++        if (header.num_layers, header.num_experts, header.top_k) != (
++            1, self.header.num_experts, self.header.top_k
++        ):
++            raise ValueError(
++                "MTP expert-pack must hold exactly one layer with the main pack's "
++                f"expert count and top-k, got {(header.num_layers, header.num_experts, header.top_k)}"
++            )
++        if int(manifest["object_stride"]) != self.object_stride:
++            raise ValueError("MTP expert-pack object stride differs from the main pack")
++        layer_id = self.header.num_layers
++        role_bytes = None
++        for entry in entries:
++            if entry.layer != 0:
++                raise ValueError("MTP expert-pack entry is not on layer 0")
++            if entry.dtype != "MXFP4" or entry.transform_id != "identity-v1" or entry.block_size != 32:
++                raise ValueError("MTP expert-pack entry is not identity MXFP4")
++            if role_bytes is None:
++                role_bytes = entry.pack_nbytes
++            elif role_bytes != entry.pack_nbytes:
++                raise ValueError("MTP expert-pack roles are not fixed size")
++            key = (layer_id, entry.expert, entry.role_id)
++            if key in self.entries:
++                raise ValueError(f"duplicate MTP expert-pack entry {key}")
++            self.entries[key] = entry
++        if role_bytes != self.role_bytes:
++            raise ValueError(
++                f"MTP expert-pack role bytes {role_bytes} != main pack {self.role_bytes}"
++            )
++        expected_size = header.data_start + header.num_experts * self.object_stride
++        if path.stat().st_size != expected_size:
++            raise ValueError("MTP expert-pack file size does not match its index")
++        for expert in range(header.num_experts):
++            object_offset = header.data_start + expert * self.object_stride
++            self.object_offsets[(layer_id, expert)] = object_offset
++            for role_id in range(len(ROLE_NAMES)):
++                entry = self.entries[(layer_id, expert, role_id)]
++                if entry.pack_offset != object_offset + role_id * role_bytes:
++                    raise ValueError(f"MTP expert-pack layout mismatch at {(expert, role_id)}")
++        open_flags = os.O_RDONLY | (os.O_DIRECT if self._mtp_direct_io else 0)
++        self._fd_by_layer[layer_id] = os.open(path, open_flags)
++        self.mtp_layer_id = layer_id
++        self.mtp_pack_path = path
++        self.mtp_pack_sha256 = str(manifest.get("pack_sha256"))
++        self.active_moe_layer_ids = frozenset(self.active_moe_layer_ids | {layer_id})
++
+     def _read_object_range(
+         self,
+         layer: int,
+@@ -618,7 +697,7 @@ class ExpertPackStore:
+         offset = object_offset + start
+         view = memoryview(staging.numpy()).cast("B")[start : start + length]
+         started = time.perf_counter_ns()
+-        read_bytes = os.preadv(self._fd, [view], offset)
++        read_bytes = os.preadv(self._fd_by_layer.get(layer, self._fd), [view], offset)
+         elapsed = time.perf_counter_ns() - started
+         if read_bytes != length:
+             raise OSError(
+@@ -679,8 +758,10 @@ class ExpertPackStore:
+ 
+     def _probe_residency(self, layer: int, expert: int) -> tuple[int, int]:
+         """Return (resident_bytes, total_bytes) of one object in the page cache."""
+-        start = self.object_offsets[(layer, expert)]
+         length = self.object_payload_bytes
++        if layer in self._fd_by_layer:
++            return 0, length  # MTP pack is not mapped for the probe; count as absent
++        start = self.object_offsets[(layer, expert)]
+         page = self._page
+         aligned = start - (start % page)
+         span = (start + length - aligned + page - 1) // page * page
+@@ -728,7 +809,9 @@ class ExpertPackStore:
+                 f"received shape {tuple(topk_ids.shape)}"
+             )
+         if is_prefill is None:
+-            is_prefill = topk_ids.shape[0] > 1
++            # Updates with at most decode_token_threshold rows are decode-like;
++            # speculative verify (num_draft_tokens rows) must not look like prefill.
++            is_prefill = topk_ids.shape[0] > self.decode_token_threshold
+         if self.tiered:
+             return self._acquire_tiered(layer, topk_ids, is_prefill=is_prefill)
+         route_ids = [int(value) for value in topk_ids.detach().cpu().reshape(-1)]
+@@ -1387,6 +1470,9 @@ class ExpertPackStore:
+         if getattr(self, "_fd", -1) >= 0:
+             os.close(self._fd)
+             self._fd = -1
++        for layer, fd in list(getattr(self, "_fd_by_layer", {}).items()):
++            os.close(fd)
++            self._fd_by_layer.pop(layer, None)
+         if getattr(self, "_probe_map", None) is not None:
+             self._libc.munmap(ctypes.c_void_p(self._probe_map), self._probe_len)
+             os.close(self._probe_fd)
+diff --git a/python/sglang/srt/layers/quantization/expert_pack.py b/python/sglang/srt/layers/quantization/expert_pack.py
+index 59d4f74..d2465ee 100644
+--- a/python/sglang/srt/layers/quantization/expert_pack.py
++++ b/python/sglang/srt/layers/quantization/expert_pack.py
+@@ -108,8 +108,19 @@ class ExpertPackMoEMethod(FusedMoEMethodBase):
+             raise ValueError("FusedMoE expert count does not match expert-pack")
+         if params_dtype not in (torch.bfloat16, torch.float16):
+             raise ValueError("expert-pack kernel requires BF16 or FP16 activations")
+-        gate_shape = self.store.entries[(layer.layer_id, 0, 0)].shape
+-        down_shape = self.store.entries[(layer.layer_id, 0, 2)].shape
++        layer_id = layer.layer_id
++        if ".decoder." in self.prefix or self.prefix.startswith("decoder."):
++            # The NextN (MTP) draft builds its single decoder layer with layer_id=0;
++            # its routed experts live in the attached MTP pack as logical layer
++            # num_layers.
++            if self.store.mtp_layer_id is None:
++                raise ValueError(
++                    "the NextN draft needs an MTP expert-pack (mtp_pack_path) attached "
++                    "to the expert-pack store"
++                )
++            layer_id = self.store.mtp_layer_id
++        gate_shape = self.store.entries[(layer_id, 0, 0)].shape
++        down_shape = self.store.entries[(layer_id, 0, 2)].shape
+         if gate_shape != (hidden_size, intermediate_size_per_partition):
+             raise ValueError(
+                 f"expert-pack gate shape {gate_shape} does not match "
+@@ -120,7 +131,7 @@ class ExpertPackMoEMethod(FusedMoEMethodBase):
+                 f"expert-pack down shape {down_shape} does not match "
+                 f"{(intermediate_size_per_partition, hidden_size)}"
+             )
+-        self.layer_id = layer.layer_id
++        self.layer_id = layer_id
+         self.hidden_size = hidden_size
+         self.intermediate_size = intermediate_size_per_partition
+ 
+@@ -294,7 +305,7 @@ class ExpertPackMoEMethod(FusedMoEMethodBase):
+         slots, host_slots = self.store.acquire(
+             self.layer_id,
+             topk_ids,
+-            is_prefill=topk_ids.shape[0] > 1,
++            is_prefill=None,  # the store classifies by its decode_token_threshold
+         )
+         cache = self.store.device_cache
+         records_per_input = topk_ids.shape[-1]
+diff --git a/python/sglang/srt/model_loader/expert_pack_loader.py b/python/sglang/srt/model_loader/expert_pack_loader.py
+index 2d1ffc1..12d92cc 100644
+--- a/python/sglang/srt/model_loader/expert_pack_loader.py
++++ b/python/sglang/srt/model_loader/expert_pack_loader.py
+@@ -45,6 +45,31 @@ from sglang.srt.runtime_context import get_exec, get_parallel
+ 
+ logger = logging.getLogger(__name__)
+ 
++# The target (full model) registers its store and module here so the NextN
++# draft worker, loaded later in the same process, can share the pack store,
++# the GGUF embedding and the GGUF lm_head instead of opening a second cache.
++_TARGET_REGISTRY: dict[str, object] = {}
++
++
++def draft_dense_weights_iterator(
++    dense_path: str | os.PathLike[str],
++) -> Generator[Tuple[str, torch.Tensor], None, None]:
++    """Yield the converted MTP dense tensors (HF `mtp.0.*` names).
++
++    Like the GGUF iterator, every `.qweight_type` precedes the raw `.qweight`
++    so the GGUF linear method knows the quant type before the payload arrives.
++    """
++    from safetensors import safe_open
++
++    with safe_open(str(dense_path), framework="pt", device="cpu") as handle:
++        keys = list(handle.keys())
++        for key in keys:
++            if key.endswith(".qweight_type"):
++                yield key, handle.get_tensor(key)
++        for key in keys:
++            if not key.endswith(".qweight_type"):
++                yield key, handle.get_tensor(key)
++
+ 
+ def _bf16_tensor(data: np.ndarray) -> torch.Tensor:
+     raw = np.asarray(data)
+@@ -167,6 +192,10 @@ class ExpertPackModelLoader(BaseModelLoader):
+ 
+     def load_model(self, *, model_config, device_config) -> nn.Module:
+         hf_config = model_config.hf_config
++        if getattr(model_config, "is_draft_model", False):
++            return self._load_draft_model(
++                model_config=model_config, device_config=device_config
++            )
+         model_kind, model_errors = validate_expert_pack_model_config(hf_config)
+         if model_errors:
+             details = "\n".join(f"- {error}" for error in model_errors)
+@@ -270,6 +299,9 @@ class ExpertPackModelLoader(BaseModelLoader):
+                 prefetch_trace_path=self.config.get("prefetch_trace_path"),
+                 prefetch_depth=int(self.config.get("prefetch_depth", 0)),
+                 prefetch_max_inflight=int(self.config.get("prefetch_max_inflight", 256)),
++                mtp_pack_path=self.config.get("mtp_pack_path"),
++                mtp_manifest_path=self.config.get("mtp_manifest_path"),
++                decode_token_threshold=int(self.config.get("decode_token_threshold", 1)),
+             )
+             weights = deepseek4_nonexpert_weights_iterator(
+                 self.source_path, int(hf_config.num_hidden_layers)
+@@ -327,6 +359,8 @@ class ExpertPackModelLoader(BaseModelLoader):
+         )
+         store.stats["dense_bytes"] = dense_bytes
+         model.expert_pack_store = store
++        _TARGET_REGISTRY["store"] = store
++        _TARGET_REGISTRY["model"] = model
+         logger.info(
+             "Loaded verified DeepSeek expert-pack model: source_sha256=%s "
+             "pack_sha256=%s dense_bytes=%d resident_experts=0",
+@@ -335,3 +369,79 @@ class ExpertPackModelLoader(BaseModelLoader):
+             dense_bytes,
+         )
+         return model.eval()
++
++    def _load_draft_model(self, *, model_config, device_config) -> nn.Module:
++        """Load the NextN (MTP) draft on top of the target's expert-pack store.
++
++        The draft directory (``--speculative-draft-model-path``) holds the
++        target config, ``mtp-dense.safetensors`` (GGUF-Q8_0 dense tensors with
++        HF ``mtp.0.*`` names) and the 1-layer MTP expert pack that the target
++        attached via ``mtp_pack_path``. The draft's routed experts are served
++        by the shared store as logical layer ``num_layers``; its embedding and
++        lm_head are the target's GGUF modules.
++        """
++        store = _TARGET_REGISTRY.get("store")
++        target = _TARGET_REGISTRY.get("model")
++        if store is None or target is None:
++            raise RuntimeError(
++                "the expert-pack target model must be loaded before its NextN draft"
++            )
++        if getattr(store, "mtp_layer_id", None) is None:
++            raise RuntimeError(
++                "expert_pack NextN draft requires mtp_pack_path in the loader config"
++            )
++        hf_config = model_config.hf_config
++        architectures = list(getattr(hf_config, "architectures", []) or [])
++        if architectures != ["DeepseekV4ForCausalLMNextN"]:
++            raise ValueError(
++                f"expert_pack draft supports DeepseekV4ForCausalLMNextN only, got {architectures}"
++            )
++        draft_dir = Path(model_config.model_path)
++        dense_path = Path(
++            self.config.get("mtp_dense_path") or draft_dir / "mtp-dense.safetensors"
++        )
++        if not dense_path.is_file():
++            raise FileNotFoundError(f"MTP dense weights are missing: {dense_path}")
++
++        quant_config = ExpertPackConfig(store)
++        target_device = torch.device(device_config.device)
++        with set_default_torch_dtype(model_config.dtype):
++            with target_device:
++                model = _initialize_model(model_config, self.load_config, quant_config)
++            model.load_weights(draft_dense_weights_iterator(dense_path))
++            # Share the target's GGUF embedding and lm_head modules (the draft's
++            # own copies were never materialized), then finalize only the draft's
++            # own quantized modules.
++            model.model.embed_tokens = target.model.embed_tokens
++            model.lm_head = target.lm_head
++            shared = {id(target.model.embed_tokens), id(target.lm_head)}
++            for _, module in model.named_modules():
++                if id(module) in shared:
++                    continue
++                quant_method = getattr(module, "quant_method", None)
++                if quant_method is not None:
++                    with device_loading_context(module, target_device):
++                        quant_method.process_weights_after_loading(module)
++
++        # The EAGLE worker binds embed/head through get_/set_embed_and_head,
++        # which assume a dense `.weight`; the GGUF modules carry `.qweight`.
++        model.set_embed_and_head = lambda embed, head: None  # already shared
++        target.get_embed_and_head = lambda: (
++            target.model.embed_tokens.qweight,
++            target.lm_head.qweight,
++        )
++        model.expert_pack_store = store
++        dense_bytes = sum(
++            value.numel() * value.element_size()
++            for name, value in model.named_parameters()
++            if not name.startswith(("model.embed_tokens", "lm_head"))
++        )
++        store.stats["draft_dense_bytes"] = dense_bytes
++        logger.info(
++            "Loaded DeepSeek expert-pack NextN draft: mtp_pack_sha256=%s "
++            "mtp_layer_id=%s draft_dense_bytes=%d",
++            getattr(store, "mtp_pack_sha256", None),
++            store.mtp_layer_id,
++            dense_bytes,
++        )
++        return model.eval()
+diff --git a/test/registered/expert_pack/test_expert_pack_runtime.py b/test/registered/expert_pack/test_expert_pack_runtime.py
+index e611f70..3189669 100644
+--- a/test/registered/expert_pack/test_expert_pack_runtime.py
++++ b/test/registered/expert_pack/test_expert_pack_runtime.py
+@@ -436,3 +436,77 @@ class TestExpertPackRuntime(unittest.TestCase):
+ 
+ if __name__ == "__main__":
+     unittest.main()
++
++
++class ExpertPackMtpAttachTest(unittest.TestCase):
++    """A 1-layer MTP pack is indexed as logical layer num_layers of the main pack."""
++
++    def test_attached_mtp_pack_is_read_as_extra_layer(self):
++        import os
++
++        with tempfile.TemporaryDirectory() as root:
++            (Path(root) / "main").mkdir()
++            (Path(root) / "mtp").mkdir()
++            main_pack, main_manifest, digests = _make_pack(Path(root) / "main")
++            mtp_pack, mtp_manifest, _ = _make_pack(Path(root) / "mtp")
++            store = ExpertPackStore(
++                main_pack,
++                manifest_path=main_manifest,
++                expected_layers=1,
++                expected_experts=2,
++                expected_top_k=1,
++                expected_source_sha256=digests["source"],
++                expected_model_identity_sha256=digests["model_identity"],
++                expected_config_sha256=digests["config"],
++                cache_vram_mib=1,
++                stage_slots=1,
++                mtp_pack_path=mtp_pack,
++                mtp_manifest_path=mtp_manifest,
++            )
++            try:
++                self.assertEqual(store.mtp_layer_id, 1)
++                self.assertEqual(store.active_moe_layer_ids, frozenset({0, 1}))
++                self.assertEqual(len(store.entries), 12)
++                self.assertEqual(len(store._route_calls_by_layer), 2)
++                staging = torch.zeros(store.object_payload_bytes, dtype=torch.uint8)
++                for expert in range(2):
++                    for layer in (0, 1):
++                        read_bytes, _ = store._read_object_range(
++                            layer, expert, staging, start=0, length=store.object_payload_bytes
++                        )
++                        self.assertEqual(read_bytes, store.object_payload_bytes)
++                        expected = b"".join(
++                            bytes([expert * 3 + role_id]) * store.role_bytes for role_id in range(3)
++                        )
++                        self.assertEqual(bytes(staging.numpy()[: len(expected)]), expected)
++                self.assertNotEqual(store._fd_by_layer[1], store._fd)
++                # the MTP file is a different file from the main pack
++                self.assertNotEqual(
++                    os.fstat(store._fd_by_layer[1]).st_ino, os.fstat(store._fd).st_ino
++                )
++            finally:
++                store.close()
++            self.assertEqual(store._fd_by_layer, {})
++
++    def test_mtp_pack_stride_mismatch_is_rejected(self):
++        with tempfile.TemporaryDirectory() as root:
++            (Path(root) / "main").mkdir()
++            (Path(root) / "mtp").mkdir()
++            main_pack, main_manifest, digests = _make_pack(Path(root) / "main")
++            mtp_pack, mtp_manifest, _ = _make_pack(Path(root) / "mtp")
++            manifest = json.loads(mtp_manifest.read_text())
++            manifest["object_stride"] = manifest["object_stride"] * 2
++            bad = Path(root) / "bad.manifest.json"
++            bad.write_text(json.dumps(manifest))
++            with self.assertRaises(ValueError):
++                ExpertPackStore(
++                    main_pack,
++                    manifest_path=main_manifest,
++                    expected_layers=1,
++                    expected_experts=2,
++                    expected_top_k=1,
++                    cache_vram_mib=1,
++                    stage_slots=1,
++                    mtp_pack_path=mtp_pack,
++                    mtp_manifest_path=bad,
++                )
+-- 
+2.43.0
+

@@ -45,6 +45,31 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
 
+# The target (full model) registers its store and module here so the NextN
+# draft worker, loaded later in the same process, can share the pack store,
+# the GGUF embedding and the GGUF lm_head instead of opening a second cache.
+_TARGET_REGISTRY: dict[str, object] = {}
+
+
+def draft_dense_weights_iterator(
+    dense_path: str | os.PathLike[str],
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Yield the converted MTP dense tensors (HF `mtp.0.*` names).
+
+    Like the GGUF iterator, every `.qweight_type` precedes the raw `.qweight`
+    so the GGUF linear method knows the quant type before the payload arrives.
+    """
+    from safetensors import safe_open
+
+    with safe_open(str(dense_path), framework="pt", device="cpu") as handle:
+        keys = list(handle.keys())
+        for key in keys:
+            if key.endswith(".qweight_type"):
+                yield key, handle.get_tensor(key)
+        for key in keys:
+            if not key.endswith(".qweight_type"):
+                yield key, handle.get_tensor(key)
+
 
 def _bf16_tensor(data: np.ndarray) -> torch.Tensor:
     raw = np.asarray(data)
@@ -167,6 +192,10 @@ class ExpertPackModelLoader(BaseModelLoader):
 
     def load_model(self, *, model_config, device_config) -> nn.Module:
         hf_config = model_config.hf_config
+        if getattr(model_config, "is_draft_model", False):
+            return self._load_draft_model(
+                model_config=model_config, device_config=device_config
+            )
         model_kind, model_errors = validate_expert_pack_model_config(hf_config)
         if model_errors:
             details = "\n".join(f"- {error}" for error in model_errors)
@@ -270,6 +299,9 @@ class ExpertPackModelLoader(BaseModelLoader):
                 prefetch_trace_path=self.config.get("prefetch_trace_path"),
                 prefetch_depth=int(self.config.get("prefetch_depth", 0)),
                 prefetch_max_inflight=int(self.config.get("prefetch_max_inflight", 256)),
+                mtp_pack_path=self.config.get("mtp_pack_path"),
+                mtp_manifest_path=self.config.get("mtp_manifest_path"),
+                decode_token_threshold=int(self.config.get("decode_token_threshold", 1)),
             )
             weights = deepseek4_nonexpert_weights_iterator(
                 self.source_path, int(hf_config.num_hidden_layers)
@@ -327,11 +359,89 @@ class ExpertPackModelLoader(BaseModelLoader):
         )
         store.stats["dense_bytes"] = dense_bytes
         model.expert_pack_store = store
+        _TARGET_REGISTRY["store"] = store
+        _TARGET_REGISTRY["model"] = model
         logger.info(
             "Loaded verified DeepSeek expert-pack model: source_sha256=%s "
             "pack_sha256=%s dense_bytes=%d resident_experts=0",
             store.header.source_blob_sha256,
             store.pack_sha256,
+            dense_bytes,
+        )
+        return model.eval()
+
+    def _load_draft_model(self, *, model_config, device_config) -> nn.Module:
+        """Load the NextN (MTP) draft on top of the target's expert-pack store.
+
+        The draft directory (``--speculative-draft-model-path``) holds the
+        target config, ``mtp-dense.safetensors`` (GGUF-Q8_0 dense tensors with
+        HF ``mtp.0.*`` names) and the 1-layer MTP expert pack that the target
+        attached via ``mtp_pack_path``. The draft's routed experts are served
+        by the shared store as logical layer ``num_layers``; its embedding and
+        lm_head are the target's GGUF modules.
+        """
+        store = _TARGET_REGISTRY.get("store")
+        target = _TARGET_REGISTRY.get("model")
+        if store is None or target is None:
+            raise RuntimeError(
+                "the expert-pack target model must be loaded before its NextN draft"
+            )
+        if getattr(store, "mtp_layer_id", None) is None:
+            raise RuntimeError(
+                "expert_pack NextN draft requires mtp_pack_path in the loader config"
+            )
+        hf_config = model_config.hf_config
+        architectures = list(getattr(hf_config, "architectures", []) or [])
+        if architectures != ["DeepseekV4ForCausalLMNextN"]:
+            raise ValueError(
+                f"expert_pack draft supports DeepseekV4ForCausalLMNextN only, got {architectures}"
+            )
+        draft_dir = Path(model_config.model_path)
+        dense_path = Path(
+            self.config.get("mtp_dense_path") or draft_dir / "mtp-dense.safetensors"
+        )
+        if not dense_path.is_file():
+            raise FileNotFoundError(f"MTP dense weights are missing: {dense_path}")
+
+        quant_config = ExpertPackConfig(store)
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(model_config, self.load_config, quant_config)
+            model.load_weights(draft_dense_weights_iterator(dense_path))
+            # Share the target's GGUF embedding and lm_head modules (the draft's
+            # own copies were never materialized), then finalize only the draft's
+            # own quantized modules.
+            model.model.embed_tokens = target.model.embed_tokens
+            model.lm_head = target.lm_head
+            shared = {id(target.model.embed_tokens), id(target.lm_head)}
+            for _, module in model.named_modules():
+                if id(module) in shared:
+                    continue
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+
+        # The EAGLE worker binds embed/head through get_/set_embed_and_head,
+        # which assume a dense `.weight`; the GGUF modules carry `.qweight`.
+        model.set_embed_and_head = lambda embed, head: None  # already shared
+        target.get_embed_and_head = lambda: (
+            target.model.embed_tokens.qweight,
+            target.lm_head.qweight,
+        )
+        model.expert_pack_store = store
+        dense_bytes = sum(
+            value.numel() * value.element_size()
+            for name, value in model.named_parameters()
+            if not name.startswith(("model.embed_tokens", "lm_head"))
+        )
+        store.stats["draft_dense_bytes"] = dense_bytes
+        logger.info(
+            "Loaded DeepSeek expert-pack NextN draft: mtp_pack_sha256=%s "
+            "mtp_layer_id=%s draft_dense_bytes=%d",
+            getattr(store, "mtp_pack_sha256", None),
+            store.mtp_layer_id,
             dense_bytes,
         )
         return model.eval()

@@ -47,3 +47,14 @@ Oracle prefetch (`prefetch_depth=k`, routing replayed from a recorded trace) on 
 | SSD → GPU (NVMe read 3.6 ms p50 + H2D) | 29.6 % stalled, 20.6 ms stall/token | 1.85 %, 2.7 ms | 1.16 %, 1.9 ms | 0.99 %, 1.8 ms | 0.87 %, 1.3 ms |
 
 Per-layer decode compute on this machine is 4–5.5 ms. **DRAM-sourced experts: 1 layer ahead is enough. SSD-sourced experts: 2 layers ahead is the minimum (stall cost ≈ 1 % of TPOT), 3–4 is the safe setting; the ≈ 1 % residual is NVMe queueing in a few slow steps, not depth.** TPOT (SSD regime, 4 GiB host cache): 516 ms → 297 → 256 → 244 → 244 → 234 ms for k = 0,1,2,3,4,6. Outputs byte-identical in all 19 runs, `io_errors=0`. Scripts, raw stats and gzipped per-layer traces: `bench/prefetch/`.
+
+## Part 4 — MTP (NextN) speculative decoding on the Expert Pack (report §16)
+
+The HF MTP shard was repacked losslessly (HF fp4 == MXFP4 up to nibble order) into a 1-layer Expert Pack that the store attaches as logical layer 43; the NextN draft loads on the target's store and shares its GGUF embedding/lm_head (`src/.../expert_pack_loader.py`, commit 0007). 5 prompts, 200 tokens, concurrency 1:
+
+| regime | baseline wall s | 1 draft step (2 verify tokens) | 2 steps | 3 steps | accept rate (1 step) |
+|---|---|---|---|---|---|
+| 33 GiB host cache | 500 | **288 (1.74×)** | 337 | 387 | 0.833 (1.84 tokens/step) |
+| 4 GiB host cache (SSD-bound) | 507 | 431 (1.18×) | – | 613 (slower) | 0.833 |
+
+Each extra draft token adds ~6 experts per layer to the verify step, so on this memory-bound machine the minimum config (`--speculative-num-steps 1 --speculative-num-draft-tokens 2`) is the optimum, and speculation only pays off with the RAM tier. Speculative outputs are not byte-identical to greedy (verify-batch numerics), but baselines reproduce byte-for-byte and the draft hit rate is 83 %. Assets builder and drivers: `bench/mtp/`.
