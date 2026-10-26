@@ -107,5 +107,40 @@ class TestTieredAcquireGPU(unittest.TestCase):
         self.assertGreater(snap["transient_uses"], 0)
 
 
+    def test_route_trace_record_and_oracle_prefetch_replay(self):
+        import json
+        seq = [0, 0, 1, 0, 1, 1, 0]
+        expected = {0: [0] * 17 + [1] * 17 + [2] * 17, 1: [3] * 17 + [4] * 17 + [5] * 17}
+        with tempfile.TemporaryDirectory() as d:
+            trace = Path(d) / "route.jsonl"
+            s = _store(Path(d), host_cache_mib=1, vram_admission_policy="paper", transient_slots=0,
+                       route_trace_path=trace, update_trace_path=Path(d) / "upd.jsonl")
+            self._run(s)
+            lines = [json.loads(l) for l in trace.read_text().splitlines()]
+            self.assertEqual([(r["s"], r["l"], r["e"]) for r in lines], [(i + 1, 0, [e]) for i, e in enumerate(seq)])
+            upd = [json.loads(l) for l in (Path(d) / "upd.jsonl").read_text().splitlines()]
+            self.assertEqual(len(upd), len(seq))
+            self.assertTrue(all(u["t_out"] > u["t_in"] for u in upd))
+            # replay with oracle prefetch one layer (= one step here) ahead
+            s2 = _store(Path(d), host_cache_mib=1, vram_admission_policy="paper", transient_slots=0,
+                        prefetch_trace_path=trace, prefetch_depth=1)
+            s2._cache = None
+            s2.initialize_device_cache("cuda")
+            # keep 2 retained slots so the prefetched expert does not evict the current one
+            dev = torch.device("cuda")
+            for expert in seq:
+                slots_t, slots = s2.acquire(0, torch.tensor([[expert]], device=dev))
+                torch.cuda.synchronize()
+                self.assertEqual(s2._cache[slots[0]].tolist(), expected[expert])
+                s2.mark_used(slots)
+            snap = s2.snapshot()
+            s2.close()
+        self.assertGreater(snap["prefetch_issued"], 0)
+        self.assertEqual(snap["prefetch_used_ready"] + snap["prefetch_used_waited"] + snap["prefetch_unused"], snap["prefetch_issued"])
+        self.assertEqual(snap["io_errors"], 0)
+        self.assertEqual(snap["cache_misses"], snap["ram_hits"] + snap["ssd_misses"])
+        self.assertEqual(snap["h2d_bytes"], (snap["ram_hits"] + snap["ssd_misses"] + snap["prefetch_issued"]) * s2.object_payload_bytes)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -265,6 +265,11 @@ class ExpertPackModelLoader(BaseModelLoader):
                     if self.config.get("transient_slots") is not None
                     else None
                 ),
+                route_trace_path=self.config.get("route_trace_path"),
+                update_trace_path=self.config.get("update_trace_path"),
+                prefetch_trace_path=self.config.get("prefetch_trace_path"),
+                prefetch_depth=int(self.config.get("prefetch_depth", 0)),
+                prefetch_max_inflight=int(self.config.get("prefetch_max_inflight", 256)),
             )
             weights = deepseek4_nonexpert_weights_iterator(
                 self.source_path, int(hf_config.num_hidden_layers)

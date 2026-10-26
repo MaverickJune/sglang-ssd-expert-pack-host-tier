@@ -1,0 +1,114 @@
+From 8a3bd9e761c200e270a89d4cb8b7ebf7de0055f9 Mon Sep 17 00:00:00 2001
+From: bench <bench@local>
+Date: Mon, 26 Oct 2026 18:20:52 +0000
+Subject: [PATCH 6/6] expert_pack: per-source (RAM/SSD) prefetch readiness and
+ wait counters
+
+Adds prefetch_used_{ready,waited}_{ram,ssd}, prefetch_wait_ns_{ram,ssd},
+prefetch_job_ns_{ram,ssd} and per-update pf_wait_{ram,ssd}_ns in the
+update trace so latency-hiding depth can be derived per source tier.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ python/sglang/srt/layers/moe/expert_pack.py | 30 ++++++++++++++++++---
+ 1 file changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/expert_pack.py b/python/sglang/srt/layers/moe/expert_pack.py
+index ef4f3e0..cfc09c5 100644
+--- a/python/sglang/srt/layers/moe/expert_pack.py
++++ b/python/sglang/srt/layers/moe/expert_pack.py
+@@ -200,6 +200,7 @@ def _initialize_runtime_state(
+     store._update_trace_file = None
+     store._prefetch_lock = threading.Lock()
+     store._prefetch_jobs = {}        # key -> Future of _prefetch_job
++    store._prefetch_source = {}      # key -> "ram" | "ssd" (source of the pending prefetch job)
+     store._prefetch_pins = {}        # (step, layer) target -> set of keys pinned for it
+     store._pinned = set()
+     store._prefetch_inflight = 0
+@@ -312,6 +313,14 @@ def _initialize_runtime_state(
+             "prefetch_skipped_inflight": 0,
+             "prefetch_already_resident": 0,
+             "prefetch_job_ns": 0,
++            "prefetch_job_ns_ram": 0,
++            "prefetch_job_ns_ssd": 0,
++            "prefetch_used_ready_ram": 0,
++            "prefetch_used_ready_ssd": 0,
++            "prefetch_used_waited_ram": 0,
++            "prefetch_used_waited_ssd": 0,
++            "prefetch_wait_ns_ram": 0,
++            "prefetch_wait_ns_ssd": 0,
+         })
+     store.miss_tier_probe = bool(miss_tier_probe)
+     store._probe_map = None
+@@ -1039,7 +1048,10 @@ class ExpertPackStore:
+                 self._ram_events[ram_slot] = ready
+                 self.stats["h2d_bytes"] = int(self.stats["h2d_bytes"]) + self.object_payload_bytes
+                 self._tier_timing.append((t_start, ready, SSD if needs_read else RAM, read_ns))
+-                self.stats["prefetch_job_ns"] = int(self.stats["prefetch_job_ns"]) + (time.perf_counter_ns() - started)
++                job_ns = time.perf_counter_ns() - started
++                self.stats["prefetch_job_ns"] = int(self.stats["prefetch_job_ns"]) + job_ns
++                src_key = "prefetch_job_ns_ssd" if needs_read else "prefetch_job_ns_ram"
++                self.stats[src_key] = int(self.stats[src_key]) + job_ns
+         except OSError:
+             with self._prefetch_lock:
+                 self.stats["io_errors"] = int(self.stats["io_errors"]) + 1
+@@ -1098,6 +1110,7 @@ class ExpertPackStore:
+                 needs_read = True
+                 self.stats["prefetch_from_ssd"] += 1
+             self.stats["prefetch_issued"] += 1
++            self._prefetch_source[key] = "ssd" if needs_read else "ram"
+             self._prefetch_jobs[key] = self._prefetch_executor.submit(
+                 self._prefetch_job, key, slot_index, ram_slot, needs_read
+             )
+@@ -1108,6 +1121,7 @@ class ExpertPackStore:
+         assert self._tier is not None and self._cache is not None
+         started_ns = time.perf_counter_ns()
+         prefetch_wait_ns = 0
++        pf_wait_src = {"ram": 0, "ssd": 0}
+         n_tier = {VRAM: 0, RAM: 0, SSD: 0}
+         route_ids = [int(value) for value in topk_ids.detach().cpu().reshape(-1)]
+         if any(expert < 0 or expert >= self.header.num_experts for expert in route_ids):
+@@ -1124,6 +1138,7 @@ class ExpertPackStore:
+                     self._pinned.discard(key)
+                     if key not in requested:
+                         self.stats["prefetch_unused"] += 1
++                        self._prefetch_source.pop(key, None)
+                         job = self._prefetch_jobs.pop(key, None)
+                         if job is not None:
+                             job.result()
+@@ -1144,14 +1159,20 @@ class ExpertPackStore:
+                     slot_index = tier.vram_slot_of(key)
+                     job = self._prefetch_jobs.pop(key, None)
+                     if job is not None:
++                        src = self._prefetch_source.pop(key, "ram")
+                         if job.done():
+                             self.stats["prefetch_used_ready"] += 1
++                            self.stats["prefetch_used_ready_" + src] += 1
+                         else:
+                             t0 = time.perf_counter_ns()
+                             job.result()
+-                            prefetch_wait_ns += time.perf_counter_ns() - t0
++                            waited = time.perf_counter_ns() - t0
++                            prefetch_wait_ns += waited
++                            pf_wait_src[src] += waited
+                             self.stats["prefetch_used_waited"] += 1
+-                        self.stats["prefetch_wait_ns"] = int(self.stats["prefetch_wait_ns"]) + prefetch_wait_ns
++                            self.stats["prefetch_used_waited_" + src] += 1
++                            self.stats["prefetch_wait_ns"] = int(self.stats["prefetch_wait_ns"]) + waited
++                            self.stats["prefetch_wait_ns_" + src] = int(self.stats["prefetch_wait_ns_" + src]) + waited
+                     self._lru.move_to_end(key)
+                     slot = self._cache_slots[slot_index]
+                     slot.frequency = self._key_frequency[key]
+@@ -1268,7 +1289,8 @@ class ExpertPackStore:
+                 self._update_trace_file.write(json.dumps({
+                     "s": tier.step, "l": layer, "p": int(is_prefill), "tok": int(topk_ids.shape[0]),
+                     "t_in": started_ns, "t_out": exit_ns, "n_vram": n_tier[VRAM], "n_ram": n_tier[RAM],
+-                    "n_ssd": n_tier[SSD], "pf_wait_ns": prefetch_wait_ns}) + "\n")
++                    "n_ssd": n_tier[SSD], "pf_wait_ns": prefetch_wait_ns,
++                    "pf_wait_ram_ns": pf_wait_src["ram"], "pf_wait_ssd_ns": pf_wait_src["ssd"]}) + "\n")
+         return torch.tensor(slots, dtype=torch.int32, device=cache_device), slots
+ 
+     def mark_used(self, slot_indices: list[int]) -> None:
+-- 
+2.43.0
+

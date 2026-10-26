@@ -128,6 +128,10 @@ class TierPolicy:
         """Called once per forward step (the first active MoE layer)."""
         self.step += 1
 
+    def ensure_history(self, key: Key) -> History:
+        """History entry without counting an access (prefetched, not yet used)."""
+        return self.history.setdefault(key, History())
+
     def record_access(self, key: Key) -> History:
         h = self.history.setdefault(key, History())
         h.access_count = min(h.access_count + 1, 1 << 30)

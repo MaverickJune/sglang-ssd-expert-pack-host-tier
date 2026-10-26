@@ -36,3 +36,14 @@ New stats: `vram_hits`, `ram_hits`, `ssd_misses`, `vram_evictions`, `demotions_t
 
 Outputs are token-identical to the original build in every configuration; NVMe bytes equal `pack_read_bytes`;
 `h2d_bytes = (ram_hits + ssd_misses) × 12.75 MiB` exactly.
+
+## Part 3 — prefetch depth needed to hide SSD→GPU and DRAM→GPU expert fetch latency (report §15)
+
+Oracle prefetch (`prefetch_depth=k`, routing replayed from a recorded trace) on the same model/prompts, decode only, per source of the prefetched expert:
+
+| source of the expert | k=1 | k=2 | k=3 | k=4 | k=6 |
+|---|---|---|---|---|---|
+| host DRAM → GPU (H2D only, 0.27 ms/expert) | 0.00 % of decode layers stalled | 0 % | 0 % | 0 % | – |
+| SSD → GPU (NVMe read 3.6 ms p50 + H2D) | 29.6 % stalled, 20.6 ms stall/token | 1.85 %, 2.7 ms | 1.16 %, 1.9 ms | 0.99 %, 1.8 ms | 0.87 %, 1.3 ms |
+
+Per-layer decode compute on this machine is 4–5.5 ms. **DRAM-sourced experts: 1 layer ahead is enough. SSD-sourced experts: 2 layers ahead is the minimum (stall cost ≈ 1 % of TPOT), 3–4 is the safe setting; the ≈ 1 % residual is NVMe queueing in a few slow steps, not depth.** TPOT (SSD regime, 4 GiB host cache): 516 ms → 297 → 256 → 244 → 244 → 234 ms for k = 0,1,2,3,4,6. Outputs byte-identical in all 19 runs, `io_errors=0`. Scripts, raw stats and gzipped per-layer traces: `bench/prefetch/`.

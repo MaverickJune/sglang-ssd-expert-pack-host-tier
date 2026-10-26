@@ -640,3 +640,67 @@ Per-request tables for the v2 runs: `bench/results/E2v2_paper_host0_pool24/`, `E
   `bench/run_experiments_e1_e4.sh` (all four from a clean shell), `bench/run_experiments_v2.sh` (E2v2–E4v2), `bench/make_experiment_table.py` (tables + sanity numbers).
 - Raw results: `bench/results/E1_lru_host0/`, `E2_paper_host0/`, `E3_paper_host33g/`, `E4_paper_host33g_vram_half/` (+ `.log`, `outputs_*.md`),
   `bench/results/experiments_aggregate.json`.
+
+---
+
+# Part 3 — How many layers ahead must an expert be prefetched to hide SSD→GPU and DRAM→GPU latency? (measured)
+
+## 15. Prefetch-depth experiment
+
+### 15.1 Question and method
+
+Question: on this machine (RTX 5090, PCIe Gen5 x16, Samsung 990 PRO behind overlayfs, EPYC 9354), when a routed expert is **not** in VRAM, how many layers *before* its layer must the fetch be issued so that the layer no longer waits for it — separately for experts that come from **SSD** (NVMe read → pinned RAM → H2D) and from **host DRAM** (RAM-cache hit → H2D only)?
+
+Method (all code is on branch `expert-pack-host-tier`, commits `77d1997` and `8a3bd9e`):
+
+1. **Oracle routing trace.** A recording run (`REC_ram33g_k0`: paper policy, 33 GiB host cache, 1614 VRAM slots, prefetch off) writes every decode/prefill routing decision `(step, layer, expert ids)` to `bench/prefetch/route.jsonl`. Decoding is deterministic at temperature 0, so the same 5 prompts reproduce the same routing; all later runs produced byte-identical outputs (checked against E1).
+2. **Replay with prefetch depth k.** `prefetch_depth=k` makes the store, right after resolving layer L of step s, look up the trace entry for layer L+k (wrapping into the next step's first layers at the end of a step) and issue a background job per expert that is not already resident: *SSD-sourced* job = O_DIRECT read into a pinned RAM slot (the read executor) followed by an H2D copy on the transfer stream; *RAM-sourced* job = H2D copy only. The target VRAM slot is chosen by the normal victim policy, and the key is pinned until its layer runs. When layer L+k arrives, `_acquire_tiered` finds the key in VRAM; if its job has finished it counts `prefetch_used_ready`, otherwise it blocks on the job and counts `prefetch_used_waited` plus the blocked time (`prefetch_wait_ns`). Commit `8a3bd9e` splits all three by source (`_ram` / `_ssd`) and writes per-update `pf_wait_ram_ns` / `pf_wait_ssd_ns` into the update trace.
+3. **Per-layer compute time** is measured from the update trace as the gap between the exit of layer L's acquire and the entry of layer L+1's acquire (`t_in(L+1) − t_out(L)`), i.e. the attention + MoE compute of one layer with nothing else of ours in it.
+4. **Two source regimes** (the policy and prompts are identical, only `host_cache_mib` changes): *SSD regime* = `host_cache_mib=4096` (only ~320 pinned slots, enough for transit; 77 % of the prefetched experts come from SSD); *RAM regime* = `host_cache_mib=33792` (2 passes; 66 % of prefetched experts come from RAM). Because each regime is still a mix, the conclusions below use the **per-source** counters, which make the mix irrelevant.
+5. Depth sweep: SSD regime k ∈ {0,1,2,3,4,6,8}, RAM regime k ∈ {0,1,2,3,4,8}. 5 prompts (first 5 of the 10-prompt set), 200 tokens, concurrency 1, temperature 0, `direct_io=true`, `transient_slots=24`, `prefetch_max_inflight=512`. 19 server launches, no failures, `io_errors=0` in all.
+
+Deliverables: `bench/prefetch/{run_pf.sh,chain.sh,chain2.sh,analyze.py,summarize_pf.py,summary.md,route.jsonl}` and `bench/prefetch/results/<run>/{update_trace.jsonl,stats_final.json,server.log,pass*/…}`.
+
+### 15.2 Baseline latencies at k = 0 (nothing prefetched; what a layer pays when it misses)
+
+Decode-only acquire time per layer update (6 experts), by the worst tier touched, from the update traces of the k = 0 runs:
+
+| run (k=0) | VRAM-only p50 | RAM-hit p50 / p90 | SSD-miss p50 / p90 | per-layer compute gap p50 | TPOT |
+|---|---|---|---|---|---|
+| `REC_ram33g_k0` (RAM regime) | 0.20 ms | 0.74 / 1.22 ms | 3.65 / 7.13 ms | 5.01 ms | 323–326 ms |
+| `SSD_host4g_k0` (SSD regime) | 0.23 ms | 0.79 / 1.50 ms | 5.59 / 10.25 ms | 6.29 ms | 516 ms |
+
+So, on the critical path, a RAM-served layer costs ≈ 0.5 ms over a VRAM-only layer, an SSD-served layer ≈ 3.5–5.5 ms (p50) and up to ≈ 10 ms (p90) — compared with ≈ 5 ms of compute per layer. (The acquire times above include Python bookkeeping and the event sync; the pure 12.75 MiB pinned H2D is 0.27 ms, §13.2.)
+
+Analytic expectation before looking at the sweep: a RAM-sourced expert needs ≈ 0.3 ms of H2D, six of them serially on one stream ≈ 1.6 ms < one layer → **k = 1 should suffice**. An SSD-sourced expert needs one ≈ 3.6 ms read plus H2D; a layer whose six experts all come from SSD needs 6 × 12.75 MiB ≈ 76 MiB at ≈ 4.1 GB/s ≈ 19 ms of NVMe time → **k = 1 is not enough; k ≈ 2 covers the typical layer, k ≈ 4 covers a full six-miss burst**.
+
+### 15.3 Result: stalls versus prefetch depth, per source (sweep 2, commit `8a3bd9e`)
+
+"Stalled" = the layer's acquire had to block on an unfinished prefetch job for at least one of its experts. Decode updates only (prefill is excluded: a prefill layer routes hundreds of experts and cannot be hidden by a layer-granular prefetch; those stalls are in the raw tables).
+
+| regime / k | decode layer-updates stalled on a **RAM-sourced** job | stalled on an **SSD-sourced** job | mean stall when stalled (SSD) | SSD stall time per decode token | TPOT (pass 1 / pass 2) |
+|---|---|---|---|---|---|
+| SSD regime k=0 | – | – (all misses synchronous) | – | 233 ms of synchronous acquire per token | 516 |
+| SSD regime k=1 | 0 / 35 088 (0.00 %) | 10 368 (29.6 %) | 1.62 ms | 20.6 ms | 297 |
+| SSD regime k=2 | 0 (0.00 %) | 649 (1.85 %) | 3.36 ms | 2.7 ms | 256 |
+| SSD regime k=3 | 0 (0.00 %) | 406 (1.16 %) | 3.73 ms | 1.9 ms | 244 |
+| SSD regime k=4 | 0 (0.00 %) | 349 (0.99 %) | 4.16 ms | 1.8 ms | 244 |
+| SSD regime k=6 | 0 (0.00 %) | 305 (0.87 %) | 3.58 ms | 1.3 ms | 234 |
+| RAM regime k=0 | – | – | – | 100 ms of synchronous acquire per token | 326 / 323 |
+| RAM regime k=1 | 2 / 70 090 (0.003 %) | 4 801 (6.85 %) | 4.61 ms | 13.6 ms | 255 / 265 |
+| RAM regime k=2 | 0 (0.00 %) | 166 (0.24 %) | 3.82 ms | 0.4 ms | 234 / 206 |
+| RAM regime k=3 | 0 (0.00 %) | 106 (0.15 %) | 4.05 ms | 0.3 ms | 211 / 206 |
+| RAM regime k=4 | 0 (0.00 %) | 77 (0.11 %) | 5.07 ms | 0.2 ms | 204 / 204 |
+
+Per-key view (all updates, prefill included; from the stats counters): RAM-sourced prefetches were ready on arrival in **100.0 %** of cases at every k ≥ 1 (2 waited keys out of 139 968 at k = 1 in the RAM regime, 0 elsewhere). SSD-sourced prefetches were ready in 72 % (k=1), 93 % (k=2), 94 % (k=3), 96 % (k=4), 97.5 % (k=6) of cases in the SSD regime; the keys that still waited did so for ≈ 3.4–4.2 ms, i.e. about one full NVMe read — they are reads that were queued behind other reads, not reads that were issued too late by a fraction.
+
+Sweep 1 (commit `77d1997`, aggregate counters only, same configs plus k = 8) agrees: SSD regime 33.9 % → 1.65 % → 0.73 % → 0.50 % of decode updates stalled for k = 1, 2, 4, 8; RAM regime 4.47 % → 0.04 % → 0.02 % → 0.05 % for k = 1, 2, 4, 8 (the RAM-regime k = 1 stalls are the SSD-sourced third of its prefetches, as sweep 2 shows). Full tables in `bench/prefetch/summary.md`.
+
+### 15.4 Answer
+
+* **DRAM → GPU: 1 layer ahead is enough.** With the fetch issued one layer (≈ 4–5 ms of compute) before use, a RAM-sourced expert was never late: 0 of 25 244 (SSD regime) and 2 of 139 968 (RAM regime) RAM-sourced prefetches had to be waited for at k = 1, and 0 at k ≥ 2. The transfer itself (0.27 ms per expert, ≤ 1.6 ms for six) is far below one layer of compute, so the only requirement is that the job be issued before the layer starts.
+* **SSD → GPU: 2 layers ahead is the minimum, 3–4 is the safe setting, more buys little.** At k = 1 (≈ 5 ms lead ≈ one NVMe read) 30 % of decode layers still stalled; at k = 2 (≈ 10 ms lead) 1.9 % stalled and the stall cost fell from 20.6 ms to 2.7 ms per decoded token (≈ 1 % of the 256 ms TPOT); k = 3–4 brings it to ≈ 1 % of layers / 1.8–1.9 ms per token; k = 6 to 0.9 % / 1.3 ms. The residual at k ≥ 3 is not a depth problem: the stalled keys wait a whole read (≈ 3.5–4 ms) because they sit behind other reads in the NVMe queue, and the stalls cluster in a few steps with abnormally long spans (0.6–0.8 s, e.g. steps 699 and 822 of every SSD run) or in the first decode steps after a prefill, when the read queue is still draining prefill-era prefetches. Hiding that tail needs more NVMe parallelism/bandwidth or admission smoothing, not a larger k.
+* **Sanity against the analytic estimate:** the measured per-layer compute gap is 4.0–5.5 ms (shrinking slightly with k as the main thread does less synchronous waiting), one NVMe read of 12.75 MiB is 3.6 ms p50 and a six-expert burst is ≈ 19 ms of NVMe time. k = 1 cannot cover even one read with margin, k = 2 covers the typical one-or-two-miss layer, k = 4 covers a six-miss burst — which is exactly the shape of the measured curve.
+* **Throughput effect (same 5 prompts, byte-identical outputs in all 19 runs):** SSD regime TPOT 516 ms (k = 0) → 297 (k=1) → 256 (k=2) → 244 (k=3, 4) → 234–237 (k=6, 8). RAM regime 323 → 255–265 (k=1) → 206–234 (k=2) → 204–211 (k=3, 4). Run-to-run noise between identical passes is ≈ ±20–30 ms, so differences beyond k = 2 (SSD) / k = 2 (RAM) are within noise except for the trend. Note that with oracle prefetch the SSD regime (4 GiB host cache) reaches the same TPOT as the RAM regime at k ≥ 3 — with an oracle, the host tier's value shifts from latency hiding to reducing NVMe traffic (1.07 TB vs 0.45 TB read per pass).
+* **Caveats.** (i) This is an *oracle* prefetch: the routing is known from a recorded trace, so the depth measured here is the pure transfer-latency requirement; a real predictor adds its own look-ahead error and would have to fetch more candidates per layer. (ii) Concurrency 1, 5 prompts, 200 tokens; with batching the per-layer compute gap grows and the required k shrinks. (iii) The pinned RAM footprint of in-flight prefetches is k × 6 slots (≤ 0.6 GiB at k = 8), which the 4 GiB transit pool absorbed without backpressure (`prefetch_skipped_inflight` = 0 in all SSD runs; 21 and 1 508 in the RAM-regime k = 4 / k = 8 runs from the 512 in-flight cap during prefill).
+

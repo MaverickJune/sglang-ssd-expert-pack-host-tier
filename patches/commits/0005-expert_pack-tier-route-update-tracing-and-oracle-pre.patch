@@ -1,0 +1,468 @@
+From 77d19970a6100806cc48daeed034aa51ca5fdba7 Mon Sep 17 00:00:00 2001
+From: bench <bench@local>
+Date: Mon, 26 Oct 2026 16:49:22 +0000
+Subject: [PATCH 5/6] expert_pack tier: route/update tracing and oracle
+ prefetch (prefetch_depth) for latency-hiding experiments
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ python/sglang/srt/layers/moe/expert_pack.py   | 247 +++++++++++++++++-
+ .../sglang/srt/layers/moe/expert_pack_tier.py |   4 +
+ .../srt/model_loader/expert_pack_loader.py    |   5 +
+ .../expert_pack/test_expert_pack_tier_gpu.py  |  35 +++
+ 4 files changed, 283 insertions(+), 8 deletions(-)
+
+diff --git a/python/sglang/srt/layers/moe/expert_pack.py b/python/sglang/srt/layers/moe/expert_pack.py
+index 654e932..ef4f3e0 100644
+--- a/python/sglang/srt/layers/moe/expert_pack.py
++++ b/python/sglang/srt/layers/moe/expert_pack.py
+@@ -176,8 +176,35 @@ def _initialize_runtime_state(
+     admission_min_accesses: int = 2,
+     admission_window_steps: int = 8,
+     transient_slots: int | None = None,
++    route_trace_path: str | os.PathLike[str] | None = None,
++    update_trace_path: str | os.PathLike[str] | None = None,
++    prefetch_trace_path: str | os.PathLike[str] | None = None,
++    prefetch_depth: int = 0,
++    prefetch_max_inflight: int = 256,
+ ) -> None:
+     store.cache_vram_mib = int(cache_vram_mib)
++    # --- experiment instrumentation: routing trace recording and oracle prefetch
++    store.route_trace_path = Path(route_trace_path).resolve() if route_trace_path else None
++    store.update_trace_path = Path(update_trace_path).resolve() if update_trace_path else None
++    store.prefetch_depth = int(prefetch_depth)
++    store.prefetch_max_inflight = int(prefetch_max_inflight)
++    store._prefetch_trace: dict[tuple[int, int], list[int]] = {}
++    if store.prefetch_depth > 0:
++        if not prefetch_trace_path:
++            raise ValueError("prefetch_depth requires prefetch_trace_path (a recorded route trace)")
++        for line in Path(prefetch_trace_path).read_text().splitlines():
++            if line.strip():
++                rec = json.loads(line)
++                store._prefetch_trace[(int(rec["s"]), int(rec["l"]))] = [int(e) for e in rec["e"]]
++    store._route_trace_file = None
++    store._update_trace_file = None
++    store._prefetch_lock = threading.Lock()
++    store._prefetch_jobs = {}        # key -> Future of _prefetch_job
++    store._prefetch_pins = {}        # (step, layer) target -> set of keys pinned for it
++    store._pinned = set()
++    store._prefetch_inflight = 0
++    store._prefetch_executor = None
++    store._prefetch_consumed = set()
+     store.host_cache_mib = int(host_cache_mib)
+     # Transient pool: extra VRAM slots *on top of* cache_vram_mib (default 4 x top-k),
+     # only with the paper policy; 0 disables the pool (transients then use the
+@@ -272,6 +299,20 @@ def _initialize_runtime_state(
+             "transient_slots": store.transient_slots if store.vram_admission_policy == "paper" else 0,
+             "demotion_d2h_bytes": 0,
+         })
++    if store.prefetch_depth > 0 or store.route_trace_path or store.update_trace_path:
++        store.stats.update({
++            "prefetch_depth": store.prefetch_depth,
++            "prefetch_issued": 0,
++            "prefetch_from_ram": 0,
++            "prefetch_from_ssd": 0,
++            "prefetch_used_ready": 0,
++            "prefetch_used_waited": 0,
++            "prefetch_wait_ns": 0,
++            "prefetch_unused": 0,
++            "prefetch_skipped_inflight": 0,
++            "prefetch_already_resident": 0,
++            "prefetch_job_ns": 0,
++        })
+     store.miss_tier_probe = bool(miss_tier_probe)
+     store._probe_map = None
+     if store.miss_tier_probe:
+@@ -333,6 +374,11 @@ class ExpertPackStore:
+         admission_min_accesses: int = 2,
+         admission_window_steps: int = 8,
+         transient_slots: int | None = None,
++        route_trace_path: str | os.PathLike[str] | None = None,
++        update_trace_path: str | os.PathLike[str] | None = None,
++        prefetch_trace_path: str | os.PathLike[str] | None = None,
++        prefetch_depth: int = 0,
++        prefetch_max_inflight: int = 256,
+     ) -> None:
+         self.path = Path(pack_path).resolve()
+         self.manifest_path = Path(
+@@ -448,6 +494,11 @@ class ExpertPackStore:
+             admission_min_accesses=admission_min_accesses,
+             admission_window_steps=admission_window_steps,
+             transient_slots=transient_slots,
++            route_trace_path=route_trace_path,
++            update_trace_path=update_trace_path,
++            prefetch_trace_path=prefetch_trace_path,
++            prefetch_depth=prefetch_depth,
++            prefetch_max_inflight=prefetch_max_inflight,
+         )
+ 
+     def initialize_device_cache(self, device: torch.device | str) -> None:
+@@ -833,6 +884,19 @@ class ExpertPackStore:
+             transient_slots=int(self.stats.get("transient_pool_slots", 0)),
+         )
+         self._first_active_layer = min(self.active_moe_layer_ids)
++        self._active_layers_sorted = sorted(self.active_moe_layer_ids)
++        if self.prefetch_depth > 0:
++            if ram_slot_count == 0:
++                raise ValueError("prefetch requires host_cache_mib > 0 (RAM slots are the read targets)")
++            self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(
++                max_workers=self.stage_slot_count, thread_name_prefix="expert-pack-prefetch"
++            )
++        if self.route_trace_path:
++            self.route_trace_path.parent.mkdir(parents=True, exist_ok=True)
++            self._route_trace_file = self.route_trace_path.open("w", buffering=1 << 20)
++        if self.update_trace_path:
++            self.update_trace_path.parent.mkdir(parents=True, exist_ok=True)
++            self._update_trace_file = self.update_trace_path.open("w", buffering=1 << 20)
+         self.stats["host_cache_slots"] = ram_slot_count
+         self.stats["host_cache_bytes"] = ram_slot_count * self.object_payload_bytes
+         logger.info(
+@@ -858,14 +922,18 @@ class ExpertPackStore:
+     def _drain_tier_timing(self, wait: bool = False) -> None:
+         """Fold completed GPU-timed transfers into the per-tier histograms."""
+         kept = []
+-        for start, end, tier, extra_ns in self._tier_timing:
++        with self._prefetch_lock:
++            pending = list(self._tier_timing)
++            self._tier_timing = []
++        for start, end, tier, extra_ns in pending:
+             if wait:
+                 end.synchronize()
+             if end.query():
+                 self._hist_add(self._tier_hist[tier], int(start.elapsed_time(end) * 1e6) + extra_ns)
+             else:
+                 kept.append((start, end, tier, extra_ns))
+-        self._tier_timing = kept
++        with self._prefetch_lock:
++            self._tier_timing = kept + self._tier_timing
+ 
+     def _ram_slot_evictable(self, slot: int) -> bool:
+         event = self._ram_events[slot]
+@@ -875,6 +943,7 @@ class ExpertPackStore:
+         """Reserve a RAM slot to read ``key`` into (bounded pool: backpressure
+         waits for the oldest in-flight transfer instead of allocating)."""
+         assert self._tier is not None
++        deadline = time.monotonic() + 120.0
+         while True:
+             slot, _evicted = self._tier.ram_alloc(key, self._ram_slot_evictable)
+             if slot is not None:
+@@ -886,10 +955,13 @@ class ExpertPackStore:
+             if oldest is None:
+                 raise RuntimeError("host expert cache has no slots")
+             event = self._ram_events[oldest]
+-            if event is not None:
+-                event.synchronize()
+-            elif self._ram_reading[oldest]:
+-                raise RuntimeError("host expert cache slot is busy with a read in flight")
++            if event is not None and not event.query():
++                event.synchronize()  # backpressure: wait for the oldest transfer
++            else:
++                # oldest slot has a read in flight (prefetch); let it finish
++                if time.monotonic() > deadline:
++                    raise RuntimeError("host expert cache slots stayed busy for 120 s")
++                time.sleep(0.0005)
+ 
+     def _evict_vram_slot(self, slot_index: int, protected_keys: set) -> None:
+         """Free a VRAM slot, demoting its expert to RAM when RAM has space."""
+@@ -915,11 +987,128 @@ class ExpertPackStore:
+             self._ram_events[ram_slot] = done
+             self.stats["demotion_d2h_bytes"] = int(self.stats["demotion_d2h_bytes"]) + self.object_payload_bytes
+ 
++    # ------------------------------------------------------------------
++    # Oracle prefetch experiment: at update (step s, layer L) start delivering
++    # the experts the recorded trace says update (s, L+k) will need (wrapping
++    # into the next step past the last MoE layer), k = prefetch_depth.  Reads
++    # and H2D run on background threads; the target update finds the experts
++    # resident (ready) or waits for the in-flight job (waited).
++    # ------------------------------------------------------------------
++    def _prefetch_target(self, step: int, layer: int) -> tuple[int, int] | None:
++        layers = self._active_layers_sorted
++        pos = layers.index(layer) + self.prefetch_depth
++        step += pos // len(layers)
++        return (step, layers[pos % len(layers)])
++
++    def _prefetch_job(self, key, vram_slot: int, ram_slot: int, needs_read: bool) -> int:
++        started = time.perf_counter_ns()
++        read_ns = 0
++        try:
++            if needs_read:
++                buffer = self._ram_views[ram_slot]
++                futures = [
++                    self._read_executor.submit(
++                        self._read_object_range, key[0], key[1], buffer, start=start, length=length
++                    )
++                    for start, length in self._object_read_ranges()
++                ]
++                results = [future.result() for future in futures]
++                read_bytes = sum(r[0] for r in results)
++                read_ns = max(r[1] for r in results)
++                with self._prefetch_lock:
++                    self._record_read(read_bytes, read_ns)
++                    self._ram_reading[ram_slot] -= 1
++            slot = self._cache_slots[vram_slot]
++            buffer = self._ram_views[ram_slot]
++            with torch.cuda.stream(self._transfer_stream):
++                if slot.ready is not None:
++                    self._transfer_stream.wait_event(slot.ready)
++                if slot.last_use is not None:
++                    self._transfer_stream.wait_event(slot.last_use)
++                prior = self._ram_events[ram_slot]
++                if prior is not None:
++                    self._transfer_stream.wait_event(prior)
++                t_start = torch.cuda.Event(enable_timing=True)
++                t_start.record(self._transfer_stream)
++                self._cache[vram_slot].copy_(buffer, non_blocking=True)
++                ready = torch.cuda.Event(enable_timing=True)
++                ready.record(self._transfer_stream)
++            with self._prefetch_lock:
++                slot.last_use = None
++                slot.ready = ready
++                self._ram_events[ram_slot] = ready
++                self.stats["h2d_bytes"] = int(self.stats["h2d_bytes"]) + self.object_payload_bytes
++                self._tier_timing.append((t_start, ready, SSD if needs_read else RAM, read_ns))
++                self.stats["prefetch_job_ns"] = int(self.stats["prefetch_job_ns"]) + (time.perf_counter_ns() - started)
++        except OSError:
++            with self._prefetch_lock:
++                self.stats["io_errors"] = int(self.stats["io_errors"]) + 1
++                if needs_read:
++                    self._ram_reading[ram_slot] -= 1
++            raise
++        finally:
++            with self._prefetch_lock:
++                self._prefetch_inflight -= 1
++        return time.perf_counter_ns() - started
++
++    def _schedule_prefetch(self, step: int, layer: int, requested: set, is_prefill: bool) -> None:
++        """Called under self._lock after the current update's keys are resolved."""
++        tier = self._tier
++        target = self._prefetch_target(step, layer)
++        experts = self._prefetch_trace.get(target)
++        if not experts:
++            return
++        pins = self._prefetch_pins.setdefault(target, set())
++        for expert in experts:
++            key = (target[1], expert)
++            if key in requested or key in self._prefetch_jobs:
++                continue
++            if key in tier.key_to_vram:
++                self.stats["prefetch_already_resident"] += 1
++                self._pinned.add(key)
++                pins.add(key)
++                continue
++            with self._prefetch_lock:
++                if self._prefetch_inflight >= self.prefetch_max_inflight:
++                    self.stats["prefetch_skipped_inflight"] += 1
++                    continue
++                self._prefetch_inflight += 1
++            tier.ensure_history(key)
++            retained = tier.should_retain(key)
++            protected = requested | self._pinned
++            slot_index = tier.pick_vram_victim(protected, retained=retained, preserve_oldest=is_prefill)
++            self._evict_vram_slot(slot_index, protected)
++            tier.install_vram(slot_index, key, retained=retained)
++            slot = self._cache_slots[slot_index]
++            slot.key = key
++            slot.generation = self.entries[(key[0], key[1], 0)].generation
++            slot.frequency = self._key_frequency.get(key, 0)
++            self._key_to_slot[key] = slot_index
++            self._lru[key] = None
++            self._pinned.add(key)
++            pins.add(key)
++            ram_slot = tier.ram_slot_of(key)
++            if ram_slot is not None:
++                tier.ram_touch(key)
++                needs_read = False
++                self.stats["prefetch_from_ram"] += 1
++            else:
++                ram_slot = self._ram_slot_for_read(key)
++                self._ram_reading[ram_slot] += 1
++                needs_read = True
++                self.stats["prefetch_from_ssd"] += 1
++            self.stats["prefetch_issued"] += 1
++            self._prefetch_jobs[key] = self._prefetch_executor.submit(
++                self._prefetch_job, key, slot_index, ram_slot, needs_read
++            )
++
+     def _acquire_tiered(
+         self, layer: int, topk_ids: torch.Tensor, *, is_prefill: bool
+     ) -> tuple[torch.Tensor, list[int]]:
+         assert self._tier is not None and self._cache is not None
+         started_ns = time.perf_counter_ns()
++        prefetch_wait_ns = 0
++        n_tier = {VRAM: 0, RAM: 0, SSD: 0}
+         route_ids = [int(value) for value in topk_ids.detach().cpu().reshape(-1)]
+         if any(expert < 0 or expert >= self.header.num_experts for expert in route_ids):
+             raise ValueError("route contains an out-of-range expert id")
+@@ -930,6 +1119,14 @@ class ExpertPackStore:
+             self._drain_tier_timing()
+             if layer == self._first_active_layer:
+                 tier.begin_step()
++            if self.prefetch_depth > 0:
++                for key in self._prefetch_pins.pop((tier.step, layer), ()):
++                    self._pinned.discard(key)
++                    if key not in requested:
++                        self.stats["prefetch_unused"] += 1
++                        job = self._prefetch_jobs.pop(key, None)
++                        if job is not None:
++                            job.result()
+             for key in requested:
+                 self._key_frequency[key] = min(self._key_frequency.get(key, 0) + 1, 255)
+                 tier.record_access(key)
+@@ -940,10 +1137,21 @@ class ExpertPackStore:
+             worst = VRAM
+             for key in sorted(requested):
+                 where = tier.classify(key)
++                n_tier[where] += 1
+                 generation = self.entries[(key[0], key[1], 0)].generation
+                 if where == VRAM:
+                     self.stats["cache_hits"] = int(self.stats["cache_hits"]) + 1
+                     slot_index = tier.vram_slot_of(key)
++                    job = self._prefetch_jobs.pop(key, None)
++                    if job is not None:
++                        if job.done():
++                            self.stats["prefetch_used_ready"] += 1
++                        else:
++                            t0 = time.perf_counter_ns()
++                            job.result()
++                            prefetch_wait_ns += time.perf_counter_ns() - t0
++                            self.stats["prefetch_used_waited"] += 1
++                        self.stats["prefetch_wait_ns"] = int(self.stats["prefetch_wait_ns"]) + prefetch_wait_ns
+                     self._lru.move_to_end(key)
+                     slot = self._cache_slots[slot_index]
+                     slot.frequency = self._key_frequency[key]
+@@ -953,10 +1161,11 @@ class ExpertPackStore:
+                 self.stats["cache_misses"] = int(self.stats["cache_misses"]) + 1
+                 worst = SSD if where == SSD or worst == SSD else RAM
+                 retained = tier.should_retain(key)  # decide before freeing a slot
++                protected = requested | self._pinned if self._pinned else requested
+                 slot_index = tier.pick_vram_victim(
+-                    requested, retained=retained, preserve_oldest=is_prefill
++                    protected, retained=retained, preserve_oldest=is_prefill
+                 )
+-                self._evict_vram_slot(slot_index, requested)
++                self._evict_vram_slot(slot_index, protected)
+                 tier.install_vram(slot_index, key, retained=retained)
+                 slot = self._cache_slots[slot_index]
+                 slot.key = key
+@@ -1049,6 +1258,17 @@ class ExpertPackStore:
+             self.stats["resident_experts"] = len(self._key_to_slot)
+             self.stats["resident_bytes"] = len(self._key_to_slot) * self.object_payload_bytes
+             self._hist_add(self._acquire_hist[worst], time.perf_counter_ns() - started_ns)
++            if self._route_trace_file is not None:
++                self._route_trace_file.write(json.dumps({
++                    "s": tier.step, "l": layer, "e": sorted({k[1] for k in requested})}) + "\n")
++            if self.prefetch_depth > 0:
++                self._schedule_prefetch(tier.step, layer, requested, is_prefill)
++            exit_ns = time.perf_counter_ns()
++            if self._update_trace_file is not None:
++                self._update_trace_file.write(json.dumps({
++                    "s": tier.step, "l": layer, "p": int(is_prefill), "tok": int(topk_ids.shape[0]),
++                    "t_in": started_ns, "t_out": exit_ns, "n_vram": n_tier[VRAM], "n_ram": n_tier[RAM],
++                    "n_ssd": n_tier[SSD], "pf_wait_ns": prefetch_wait_ns}) + "\n")
+         return torch.tensor(slots, dtype=torch.int32, device=cache_device), slots
+ 
+     def mark_used(self, slot_indices: list[int]) -> None:
+@@ -1070,6 +1290,9 @@ class ExpertPackStore:
+             ):
+                 self._write_stats()
+                 self._last_stats_flush_calls = route_calls
++                for f in (self._route_trace_file, self._update_trace_file):
++                    if f is not None:
++                        f.flush()
+ 
+     @property
+     def device_cache(self) -> torch.Tensor:
+@@ -1126,6 +1349,14 @@ class ExpertPackStore:
+         temporary.replace(self.stats_path)
+ 
+     def close(self) -> None:
++        if getattr(self, "_prefetch_executor", None) is not None:
++            self._prefetch_executor.shutdown(wait=True)
++            self._prefetch_executor = None
++        for name in ("_route_trace_file", "_update_trace_file"):
++            f = getattr(self, name, None)
++            if f is not None:
++                f.close()
++                setattr(self, name, None)
+         if self._read_executor is not None:
+             self._read_executor.shutdown(wait=True)
+             self._read_executor = None
+diff --git a/python/sglang/srt/layers/moe/expert_pack_tier.py b/python/sglang/srt/layers/moe/expert_pack_tier.py
+index 63a227c..350db0b 100644
+--- a/python/sglang/srt/layers/moe/expert_pack_tier.py
++++ b/python/sglang/srt/layers/moe/expert_pack_tier.py
+@@ -128,6 +128,10 @@ class TierPolicy:
+         """Called once per forward step (the first active MoE layer)."""
+         self.step += 1
+ 
++    def ensure_history(self, key: Key) -> History:
++        """History entry without counting an access (prefetched, not yet used)."""
++        return self.history.setdefault(key, History())
++
+     def record_access(self, key: Key) -> History:
+         h = self.history.setdefault(key, History())
+         h.access_count = min(h.access_count + 1, 1 << 30)
+diff --git a/python/sglang/srt/model_loader/expert_pack_loader.py b/python/sglang/srt/model_loader/expert_pack_loader.py
+index 8925f89..2d1ffc1 100644
+--- a/python/sglang/srt/model_loader/expert_pack_loader.py
++++ b/python/sglang/srt/model_loader/expert_pack_loader.py
+@@ -265,6 +265,11 @@ class ExpertPackModelLoader(BaseModelLoader):
+                     if self.config.get("transient_slots") is not None
+                     else None
+                 ),
++                route_trace_path=self.config.get("route_trace_path"),
++                update_trace_path=self.config.get("update_trace_path"),
++                prefetch_trace_path=self.config.get("prefetch_trace_path"),
++                prefetch_depth=int(self.config.get("prefetch_depth", 0)),
++                prefetch_max_inflight=int(self.config.get("prefetch_max_inflight", 256)),
+             )
+             weights = deepseek4_nonexpert_weights_iterator(
+                 self.source_path, int(hf_config.num_hidden_layers)
+diff --git a/test/registered/expert_pack/test_expert_pack_tier_gpu.py b/test/registered/expert_pack/test_expert_pack_tier_gpu.py
+index b36f089..d07ee47 100644
+--- a/test/registered/expert_pack/test_expert_pack_tier_gpu.py
++++ b/test/registered/expert_pack/test_expert_pack_tier_gpu.py
+@@ -107,5 +107,40 @@ class TestTieredAcquireGPU(unittest.TestCase):
+         self.assertGreater(snap["transient_uses"], 0)
+ 
+ 
++    def test_route_trace_record_and_oracle_prefetch_replay(self):
++        import json
++        seq = [0, 0, 1, 0, 1, 1, 0]
++        expected = {0: [0] * 17 + [1] * 17 + [2] * 17, 1: [3] * 17 + [4] * 17 + [5] * 17}
++        with tempfile.TemporaryDirectory() as d:
++            trace = Path(d) / "route.jsonl"
++            s = _store(Path(d), host_cache_mib=1, vram_admission_policy="paper", transient_slots=0,
++                       route_trace_path=trace, update_trace_path=Path(d) / "upd.jsonl")
++            self._run(s)
++            lines = [json.loads(l) for l in trace.read_text().splitlines()]
++            self.assertEqual([(r["s"], r["l"], r["e"]) for r in lines], [(i + 1, 0, [e]) for i, e in enumerate(seq)])
++            upd = [json.loads(l) for l in (Path(d) / "upd.jsonl").read_text().splitlines()]
++            self.assertEqual(len(upd), len(seq))
++            self.assertTrue(all(u["t_out"] > u["t_in"] for u in upd))
++            # replay with oracle prefetch one layer (= one step here) ahead
++            s2 = _store(Path(d), host_cache_mib=1, vram_admission_policy="paper", transient_slots=0,
++                        prefetch_trace_path=trace, prefetch_depth=1)
++            s2._cache = None
++            s2.initialize_device_cache("cuda")
++            # keep 2 retained slots so the prefetched expert does not evict the current one
++            dev = torch.device("cuda")
++            for expert in seq:
++                slots_t, slots = s2.acquire(0, torch.tensor([[expert]], device=dev))
++                torch.cuda.synchronize()
++                self.assertEqual(s2._cache[slots[0]].tolist(), expected[expert])
++                s2.mark_used(slots)
++            snap = s2.snapshot()
++            s2.close()
++        self.assertGreater(snap["prefetch_issued"], 0)
++        self.assertEqual(snap["prefetch_used_ready"] + snap["prefetch_used_waited"] + snap["prefetch_unused"], snap["prefetch_issued"])
++        self.assertEqual(snap["io_errors"], 0)
++        self.assertEqual(snap["cache_misses"], snap["ram_hits"] + snap["ssd_misses"])
++        self.assertEqual(snap["h2d_bytes"], (snap["ram_hits"] + snap["ssd_misses"] + snap["prefetch_issued"]) * s2.object_payload_bytes)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+

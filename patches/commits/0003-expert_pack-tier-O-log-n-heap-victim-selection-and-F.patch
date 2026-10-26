@@ -1,7 +1,7 @@
 From f2f5c45791bdc91461f09a24085c626a82df74d1 Mon Sep 17 00:00:00 2001
 From: bench <bench@local>
 Date: Sun, 25 Oct 2026 02:52:34 +0000
-Subject: [PATCH 3/4] expert_pack tier: O(log n) heap victim selection and FIFO
+Subject: [PATCH 3/6] expert_pack tier: O(log n) heap victim selection and FIFO
  transient pool
 
 Retained victims come from a lazy min-heap keyed (access_count, last_access,
