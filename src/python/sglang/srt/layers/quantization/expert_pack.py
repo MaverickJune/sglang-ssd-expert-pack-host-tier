@@ -302,11 +302,20 @@ class ExpertPackMoEMethod(FusedMoEMethodBase):
                 finally:
                     self.store.mark_used(host_slots)
             return StandardCombineInput(hidden_states=torch.cat(token_outputs, dim=0))
-        slots, host_slots = self.store.acquire(
+        slots, host_slots, keep_mask = self.store.acquire(
             self.layer_id,
             topk_ids,
             is_prefill=None,  # the store classifies by its decode_token_threshold
+            topk_weights=topk_weights,
+            return_mask=True,
         )
+        if self.store.approx_draft_experts != "off":
+            # Approximate rows: zero the dropped experts' gate weights and renormalise
+            # the kept ones so the row keeps its original total gate mass.
+            w = topk_weights.to(torch.float32)
+            kept = w * keep_mask
+            scale = w.sum(dim=-1, keepdim=True) / kept.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+            topk_weights = (kept * scale).to(topk_weights.dtype)
         cache = self.store.device_cache
         records_per_input = topk_ids.shape[-1]
         gate, up = mxfp4_matvec_dual(

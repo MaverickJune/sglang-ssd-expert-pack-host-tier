@@ -1,0 +1,1362 @@
+{
+ "A0_exact_greedy": {
+  "agree": 785,
+  "scored": 811,
+  "rate": 0.967940813810111,
+  "per_prompt": [
+   {
+    "prompt": "alpaca-37246",
+    "scored": 200,
+    "agree": 192,
+    "first_disagreement": 84,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      84,
+      " Sid",
+      " Pizza"
+     ],
+     [
+      88,
+      "ne",
+      "the"
+     ],
+     [
+      94,
+      " Core",
+      " Plot"
+     ],
+     [
+      131,
+      " return",
+      " get"
+     ],
+     [
+      150,
+      ".\n\n",
+      ","
+     ],
+     [
+      167,
+      " Introduce",
+      " Set"
+     ],
+     [
+      187,
+      " Incident",
+      " incident"
+     ],
+     [
+      192,
+      " Woody",
+      " disrupting"
+     ]
+    ]
+   },
+   {
+    "prompt": "mmlu-abstract_algebra-14",
+    "scored": 200,
+    "agree": 195,
+    "first_disagreement": 63,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      63,
+      ".",
+      " max"
+     ],
+     [
+      87,
+      ".",
+      ".\n\n"
+     ],
+     [
+      102,
+      " Try",
+      " Candidate"
+     ],
+     [
+      103,
+      " partitions",
+      " "
+     ],
+     [
+      111,
+      " =",
+      " l"
+     ]
+    ]
+   },
+   {
+    "prompt": "alpaca-50812",
+    "scored": 200,
+    "agree": 198,
+    "first_disagreement": 134,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      134,
+      " fun",
+      " creative"
+     ],
+     [
+      193,
+      " paper",
+      " all"
+     ]
+    ]
+   },
+   {
+    "prompt": "mmlu-moral_disputes-8315",
+    "scored": 92,
+    "agree": 89,
+    "first_disagreement": 51,
+    "inserted_special": 1,
+    "disagreements": [
+     [
+      51,
+      " further",
+      ","
+     ],
+     [
+      70,
+      ".D",
+      "."
+     ],
+     [
+      73,
+      " the",
+      "D"
+     ]
+    ]
+   },
+   {
+    "prompt": "alpaca-9907",
+    "scored": 119,
+    "agree": 111,
+    "first_disagreement": 30,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      30,
+      " The",
+      " I"
+     ],
+     [
+      50,
+      " a",
+      " an"
+     ],
+     [
+      103,
+      " aim",
+      " give"
+     ],
+     [
+      107,
+      ",",
+      " English"
+     ],
+     [
+      110,
+      " English",
+      " translation"
+     ],
+     [
+      112,
+      ".The",
+      "."
+     ],
+     [
+      113,
+      " sun",
+      " user"
+     ],
+     [
+      114,
+      " doesn",
+      " is"
+     ]
+    ]
+   }
+  ]
+ },
+ "A1_exact_spec": {
+  "agree": 782,
+  "scored": 800,
+  "rate": 0.9775,
+  "per_prompt": [
+   {
+    "prompt": "alpaca-37246",
+    "scored": 200,
+    "agree": 199,
+    "first_disagreement": 70,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      70,
+      ").\n",
+      "),"
+     ]
+    ]
+   },
+   {
+    "prompt": "mmlu-abstract_algebra-14",
+    "scored": 200,
+    "agree": 194,
+    "first_disagreement": 50,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      50,
+      " ",
+      ":"
+     ],
+     [
+      59,
+      " Let",
+      " Need"
+     ],
+     [
+      87,
+      ".",
+      ".\n\n"
+     ],
+     [
+      124,
+      "21",
+      " "
+     ],
+     [
+      127,
+      "4",
+      "6"
+     ],
+     [
+      194,
+      " =",
+      " gives"
+     ]
+    ]
+   },
+   {
+    "prompt": "alpaca-50812",
+    "scored": 200,
+    "agree": 198,
+    "first_disagreement": 98,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      98,
+      "good",
+      "great"
+     ],
+     [
+      188,
+      " collaborative",
+      " and"
+     ]
+    ]
+   },
+   {
+    "prompt": "mmlu-moral_disputes-8315",
+    "scored": 105,
+    "agree": 102,
+    "first_disagreement": 19,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      19,
+      " is",
+      ","
+     ],
+     [
+      20,
+      " Garrett",
+      " known"
+     ],
+     [
+      83,
+      ".D",
+      "."
+     ]
+    ]
+   },
+   {
+    "prompt": "alpaca-9907",
+    "scored": 95,
+    "agree": 89,
+    "first_disagreement": 38,
+    "inserted_special": 1,
+    "disagreements": [
+     [
+      38,
+      " stating",
+      " describing"
+     ],
+     [
+      63,
+      " The",
+      "The"
+     ],
+     [
+      64,
+      " structure",
+      " sun"
+     ],
+     [
+      66,
+      " basic",
+      " simple"
+     ],
+     [
+      77,
+      " I",
+      " The"
+     ],
+     [
+      89,
+      ".The",
+      "."
+     ]
+    ]
+   }
+  ]
+ },
+ "B1_approx_vram": {
+  "agree": 784,
+  "scored": 916,
+  "rate": 0.8558951965065502,
+  "per_prompt": [
+   {
+    "prompt": "alpaca-37246",
+    "scored": 199,
+    "agree": 173,
+    "first_disagreement": 3,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      3,
+      " The",
+      " **"
+     ],
+     [
+      5,
+      " is",
+      " asks"
+     ],
+     [
+      7,
+      " to",
+      " for"
+     ],
+     [
+      18,
+      " \"",
+      " I"
+     ],
+     [
+      30,
+      ".\n",
+      "."
+     ],
+     [
+      34,
+      " The",
+      " I"
+     ],
+     [
+      40,
+      " capture",
+      " cover"
+     ],
+     [
+      48,
+      " the",
+      " themes"
+     ],
+     [
+      72,
+      " action",
+      "),"
+     ],
+     [
+      79,
+      " the",
+      " jealousy"
+     ],
+     [
+      90,
+      "/re",
+      ","
+     ],
+     [
+      91,
+      "placed",
+      "jected"
+     ],
+     [
+      94,
+      " journey",
+      " adventure"
+     ],
+     [
+      103,
+      " moral",
+      " resolution"
+     ],
+     [
+      115,
+      " Start",
+      " Brief"
+     ],
+     [
+      135,
+      ".H",
+      ".\n"
+     ],
+     [
+      143,
+      " *",
+      " \""
+     ],
+     [
+      148,
+      "In",
+      "**"
+     ],
+     [
+      149,
+      " a",
+      " the"
+     ],
+     [
+      156,
+      ",",
+      " when"
+     ]
+    ]
+   },
+   {
+    "prompt": "mmlu-abstract_algebra-14",
+    "scored": 200,
+    "agree": 166,
+    "first_disagreement": 3,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      3,
+      " question",
+      " multiple"
+     ],
+     [
+      5,
+      " \"",
+      " Need"
+     ],
+     [
+      11,
+      " element",
+      " an"
+     ],
+     [
+      33,
+      ".",
+      " and"
+     ],
+     [
+      34,
+      " For",
+      " Need"
+     ],
+     [
+      35,
+      " S",
+      " symmetric"
+     ],
+     [
+      37,
+      "?",
+      ","
+     ],
+     [
+      38,
+      " S",
+      " Wait"
+     ],
+     [
+      45,
+      ".",
+      "?"
+     ],
+     [
+      46,
+      " Maximum",
+      " Order"
+     ],
+     [
+      50,
+      " in",
+      " is"
+     ],
+     [
+      51,
+      " symmetric",
+      " S"
+     ],
+     [
+      64,
+      ".",
+      " ("
+     ],
+     [
+      71,
+      " maximum",
+      " maximize"
+     ],
+     [
+      75,
+      " parts",
+      " positive"
+     ],
+     [
+      81,
+      " We",
+      " Let"
+     ],
+     [
+      83,
+      " find",
+      " compute"
+     ],
+     [
+      88,
+      " partitions",
+      " integer"
+     ],
+     [
+      93,
+      " Known",
+      " Let"
+     ],
+     [
+      111,
+      ":",
+      " and"
+     ]
+    ]
+   },
+   {
+    "prompt": "alpaca-50812",
+    "scored": 200,
+    "agree": 170,
+    "first_disagreement": 17,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      17,
+      " pencils",
+      " A"
+     ],
+     [
+      26,
+      " Goal",
+      " Task"
+     ],
+     [
+      30,
+      " interesting",
+      " *"
+     ],
+     [
+      41,
+      "s",
+      "raint"
+     ],
+     [
+      44,
+      " a",
+      " helpful"
+     ],
+     [
+      60,
+      " *",
+      " Drawing"
+     ],
+     [
+      63,
+      "Art",
+      "Col"
+     ],
+     [
+      66,
+      " D",
+      " Ob"
+     ],
+     [
+      68,
+      "leb",
+      "ling"
+     ],
+     [
+      69,
+      "omb",
+      "ob"
+     ],
+     [
+      75,
+      " comic",
+      " blind"
+     ],
+     [
+      76,
+      " strips",
+      " strip"
+     ],
+     [
+      78,
+      " Zent",
+      " z"
+     ],
+     [
+      96,
+      "sur",
+      "Sur"
+     ],
+     [
+      103,
+      " contest",
+      " decorating"
+     ],
+     [
+      105,
+      "ne",
+      "mark"
+     ],
+     [
+      107,
+      " tape",
+      " markers"
+     ],
+     [
+      110,
+      " pencils",
+      " can"
+     ],
+     [
+      111,
+      "/m",
+      " can"
+     ],
+     [
+      114,
+      " be",
+      " decorate"
+     ]
+    ]
+   },
+   {
+    "prompt": "mmlu-moral_disputes-8315",
+    "scored": 119,
+    "agree": 106,
+    "first_disagreement": 19,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      19,
+      " is",
+      ","
+     ],
+     [
+      20,
+      " likely",
+      " known"
+     ],
+     [
+      35,
+      " \"",
+      " his"
+     ],
+     [
+      49,
+      " how",
+      " the"
+     ],
+     [
+      53,
+      " (",
+      " to"
+     ],
+     [
+      54,
+      "like",
+      "world"
+     ],
+     [
+      60,
+      " can",
+      " leads"
+     ],
+     [
+      63,
+      " more",
+      " increased"
+     ],
+     [
+      64,
+      " problems",
+      " population"
+     ],
+     [
+      65,
+      ",",
+      " because"
+     ],
+     [
+      66,
+      " escalating",
+      " as"
+     ],
+     [
+      72,
+      ":",
+      " that"
+     ],
+     [
+      97,
+      ".D",
+      "."
+     ]
+    ]
+   },
+   {
+    "prompt": "alpaca-9907",
+    "scored": 198,
+    "agree": 169,
+    "first_disagreement": 23,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      23,
+      " I",
+      " This"
+     ],
+     [
+      27,
+      " an",
+      " the"
+     ],
+     [
+      30,
+      " while",
+      " that"
+     ],
+     [
+      31,
+      " being",
+      " keeping"
+     ],
+     [
+      34,
+      "Let",
+      "This"
+     ],
+     [
+      58,
+      "n",
+      " not"
+     ],
+     [
+      61,
+      ",\"",
+      "\""
+     ],
+     [
+      75,
+      " is",
+      " would"
+     ],
+     [
+      87,
+      " the",
+      " a"
+     ],
+     [
+      89,
+      " along",
+      " clearly"
+     ],
+     [
+      109,
+      " I",
+      " The"
+     ],
+     [
+      112,
+      " the",
+      " it"
+     ],
+     [
+      114,
+      " in",
+      " clear"
+     ],
+     [
+      122,
+      ".The",
+      "."
+     ],
+     [
+      123,
+      " translation",
+      " sun"
+     ],
+     [
+      124,
+      " of",
+      " is"
+     ],
+     [
+      125,
+      " the",
+      " \""
+     ],
+     [
+      126,
+      " Spanish",
+      " phrase"
+     ],
+     [
+      128,
+      " **",
+      " \""
+     ],
+     [
+      138,
+      " is",
+      " into"
+     ]
+    ]
+   }
+  ]
+ },
+ "B2_approx_ram": {
+  "agree": 826,
+  "scored": 893,
+  "rate": 0.9249720044792833,
+  "per_prompt": [
+   {
+    "prompt": "alpaca-37246",
+    "scored": 200,
+    "agree": 180,
+    "first_disagreement": 3,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      3,
+      " The",
+      " **"
+     ],
+     [
+      15,
+      "\".",
+      "\".\n"
+     ],
+     [
+      16,
+      " I",
+      " This"
+     ],
+     [
+      24,
+      " summary",
+      " overview"
+     ],
+     [
+      25,
+      ",",
+      " covering"
+     ],
+     [
+      35,
+      ".\n\n",
+      ","
+     ],
+     [
+      39,
+      " **",
+      " Key"
+     ],
+     [
+      53,
+      ",",
+      " ("
+     ],
+     [
+      76,
+      " around",
+      " looking"
+     ],
+     [
+      87,
+      " vs",
+      " of"
+     ],
+     [
+      92,
+      ";",
+      ","
+     ],
+     [
+      95,
+      " identity",
+      " del"
+     ],
+     [
+      97,
+      ".\n",
+      " ("
+     ],
+     [
+      102,
+      " points",
+      " progression"
+     ],
+     [
+      107,
+      " Sid",
+      " ending"
+     ],
+     [
+      119,
+      ".\n",
+      " ("
+     ],
+     [
+      175,
+      " the",
+      " Woody"
+     ],
+     [
+      177,
+      ".\n",
+      " ("
+     ],
+     [
+      183,
+      " adventure",
+      " journey"
+     ],
+     [
+      184,
+      ".\n",
+      "/"
+     ]
+    ]
+   },
+   {
+    "prompt": "mmlu-abstract_algebra-14",
+    "scored": 200,
+    "agree": 189,
+    "first_disagreement": 60,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      60,
+      " Need",
+      " Let"
+     ],
+     [
+      70,
+      " need",
+      " cycle"
+     ],
+     [
+      74,
+      " Known",
+      " Let"
+     ],
+     [
+      77,
+      " function",
+      "'s"
+     ],
+     [
+      91,
+      " whose",
+      " positive"
+     ],
+     [
+      95,
+      ".",
+      " with"
+     ],
+     [
+      102,
+      " lengths",
+      " "
+     ],
+     [
+      106,
+      "+",
+      ","
+     ],
+     [
+      110,
+      "=",
+      " ="
+     ],
+     [
+      165,
+      " plus",
+      "."
+     ],
+     [
+      197,
+      "?",
+      "."
+     ]
+    ]
+   },
+   {
+    "prompt": "alpaca-50812",
+    "scored": 200,
+    "agree": 185,
+    "first_disagreement": 41,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      41,
+      " using",
+      " based"
+     ],
+     [
+      68,
+      " *",
+      " Drawing"
+     ],
+     [
+      77,
+      " a",
+      ".\n"
+     ],
+     [
+      103,
+      "Sur",
+      "sur"
+     ],
+     [
+      121,
+      "vision",
+      "w"
+     ],
+     [
+      134,
+      "w",
+      "mur"
+     ],
+     [
+      137,
+      "\",",
+      "\""
+     ],
+     [
+      138,
+      " making",
+      " playing"
+     ],
+     [
+      151,
+      " a",
+      " something"
+     ],
+     [
+      154,
+      " ones",
+      ","
+     ],
+     [
+      157,
+      " the",
+      " them"
+     ],
+     [
+      160,
+      ",",
+      " or"
+     ],
+     [
+      169,
+      " primary",
+      " clear"
+     ],
+     [
+      170,
+      " suggestion",
+      " recommendation"
+     ],
+     [
+      172,
+      "\n",
+      " The"
+     ]
+    ]
+   },
+   {
+    "prompt": "mmlu-moral_disputes-8315",
+    "scored": 123,
+    "agree": 120,
+    "first_disagreement": 16,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      16,
+      "\".",
+      ".\""
+     ],
+     [
+      54,
+      " population",
+      " more"
+     ],
+     [
+      67,
+      " Option",
+      " So"
+     ]
+    ]
+   },
+   {
+    "prompt": "alpaca-9907",
+    "scored": 170,
+    "agree": 152,
+    "first_disagreement": 2,
+    "inserted_special": 1,
+    "disagreements": [
+     [
+      2,
+      " has",
+      " wants"
+     ],
+     [
+      3,
+      " provided",
+      " asked"
+     ],
+     [
+      7,
+      " to",
+      " and"
+     ],
+     [
+      11,
+      ":",
+      "."
+     ],
+     [
+      36,
+      " need",
+      " can"
+     ],
+     [
+      45,
+      " sentence",
+      " meaning"
+     ],
+     [
+      88,
+      " the",
+      " whether"
+     ],
+     [
+      124,
+      " for",
+      " since"
+     ],
+     [
+      125,
+      " a",
+      " describing"
+     ],
+     [
+      136,
+      " The",
+      "The"
+     ],
+     [
+      137,
+      " translation",
+      " sun"
+     ],
+     [
+      139,
+      " direct",
+      ":"
+     ],
+     [
+      141,
+      " there",
+      " accurate"
+     ],
+     [
+      151,
+      " worry",
+      " consider"
+     ],
+     [
+      153,
+      " here",
+      "."
+     ],
+     [
+      155,
+      " I",
+      " The"
+     ],
+     [
+      159,
+      " translation",
+      " most"
+     ],
+     [
+      160,
+      " clearly",
+      "."
+     ]
+    ]
+   }
+  ]
+ },
+ "B3_approx_draftlayer": {
+  "agree": 790,
+  "scored": 806,
+  "rate": 0.9801488833746899,
+  "per_prompt": [
+   {
+    "prompt": "alpaca-37246",
+    "scored": 200,
+    "agree": 199,
+    "first_disagreement": 70,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      70,
+      ").\n",
+      "),"
+     ]
+    ]
+   },
+   {
+    "prompt": "mmlu-abstract_algebra-14",
+    "scored": 200,
+    "agree": 194,
+    "first_disagreement": 50,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      50,
+      " ",
+      ":"
+     ],
+     [
+      59,
+      " Let",
+      " Need"
+     ],
+     [
+      87,
+      ".",
+      ".\n\n"
+     ],
+     [
+      124,
+      "21",
+      " "
+     ],
+     [
+      127,
+      "4",
+      "6"
+     ],
+     [
+      194,
+      " =",
+      " gives"
+     ]
+    ]
+   },
+   {
+    "prompt": "alpaca-50812",
+    "scored": 200,
+    "agree": 198,
+    "first_disagreement": 98,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      98,
+      "good",
+      "great"
+     ],
+     [
+      188,
+      " collaborative",
+      " and"
+     ]
+    ]
+   },
+   {
+    "prompt": "mmlu-moral_disputes-8315",
+    "scored": 108,
+    "agree": 106,
+    "first_disagreement": 19,
+    "inserted_special": 0,
+    "disagreements": [
+     [
+      19,
+      " is",
+      ","
+     ],
+     [
+      20,
+      " Garrett",
+      " known"
+     ]
+    ]
+   },
+   {
+    "prompt": "alpaca-9907",
+    "scored": 98,
+    "agree": 93,
+    "first_disagreement": 38,
+    "inserted_special": 1,
+    "disagreements": [
+     [
+      38,
+      " stating",
+      " describing"
+     ],
+     [
+      63,
+      " The",
+      "The"
+     ],
+     [
+      64,
+      " structure",
+      " sun"
+     ],
+     [
+      66,
+      " basic",
+      " simple"
+     ],
+     [
+      77,
+      " I",
+      " The"
+     ]
+    ]
+   }
+  ]
+ }
+}

@@ -300,6 +300,12 @@ def _initialize_runtime_state(
             "admission_window_steps": store.admission_window_steps,
             "transient_slots": store.transient_slots if store.vram_admission_policy == "paper" else 0,
             "demotion_d2h_bytes": 0,
+            "approx_draft_experts": store.approx_draft_experts,
+            "approx_rows": 0,
+            "approx_requests": 0,
+            "approx_dropped_ssd": 0,
+            "approx_dropped_ram": 0,
+            "approx_forced_rows": 0,
         })
     if store.prefetch_depth > 0 or store.route_trace_path or store.update_trace_path:
         store.stats.update({
@@ -363,6 +369,10 @@ class ExpertPackStore:
     mtp_layer_id: int | None = None
     _fd_by_layer: dict[int, int] = {}
     decode_token_threshold: int = 1
+    # Approximate expert fetching for speculative draft positions (see _approx_plan).
+    approx_draft_experts: str = "off"  # "off" | "vram" | "ram"
+    approx_rows_period: int = 0  # row r of a decode-like update is exact iff r % period == 0
+    approx_draft_layer: bool = True  # also approximate the MTP draft layer itself
 
     def __init__(
         self,
@@ -397,8 +407,18 @@ class ExpertPackStore:
         mtp_pack_path: str | os.PathLike[str] | None = None,
         mtp_manifest_path: str | os.PathLike[str] | None = None,
         decode_token_threshold: int = 1,
+        approx_draft_experts: str = "off",
+        approx_rows_period: int | None = None,
+        approx_draft_layer: bool = True,
     ) -> None:
         self.decode_token_threshold = max(1, int(decode_token_threshold))
+        if approx_draft_experts not in ("off", "vram", "ram"):
+            raise ValueError("approx_draft_experts must be 'off', 'vram' or 'ram'")
+        self.approx_draft_experts = approx_draft_experts
+        self.approx_rows_period = int(
+            approx_rows_period if approx_rows_period is not None else self.decode_token_threshold
+        )
+        self.approx_draft_layer = bool(approx_draft_layer)
         self.path = Path(pack_path).resolve()
         self.manifest_path = Path(
             manifest_path or str(self.path) + ".manifest.json"
@@ -793,8 +813,18 @@ class ExpertPackStore:
         self.stats["pack_read_ns"] = int(self.stats["pack_read_ns"]) + elapsed
 
     def acquire(
-        self, layer: int, topk_ids: torch.Tensor, *, is_prefill: bool | None = None
-    ) -> tuple[torch.Tensor, list[int]]:
+        self, layer: int, topk_ids: torch.Tensor, *, is_prefill: bool | None = None,
+        topk_weights: torch.Tensor | None = None, return_mask: bool = False,
+    ):
+        """Return ``(slots, host_slots)`` (or ``(slots, host_slots, keep_mask)`` with
+        ``return_mask``) for the routed experts of one MoE layer update.
+
+        ``keep_mask`` is a ``[tokens, top_k]`` float tensor on the cache device:
+        1 where the routed expert is used, 0 where approximate fetching dropped it
+        (the slot at that position then points at a kept expert of the same row and
+        the caller must zero its gate weight). It is all-ones unless
+        ``approx_draft_experts`` is enabled and the update has approximable rows.
+        """
         if (
             self._cache is None
             or self._transfer_stream is None
@@ -813,7 +843,12 @@ class ExpertPackStore:
             # speculative verify (num_draft_tokens rows) must not look like prefill.
             is_prefill = topk_ids.shape[0] > self.decode_token_threshold
         if self.tiered:
-            return self._acquire_tiered(layer, topk_ids, is_prefill=is_prefill)
+            out = self._acquire_tiered(
+                layer, topk_ids, is_prefill=is_prefill, topk_weights=topk_weights
+            )
+            return out if return_mask else out[:2]
+        if return_mask:
+            raise ValueError("approximate fetching needs the tiered store")
         route_ids = [int(value) for value in topk_ids.detach().cpu().reshape(-1)]
         if any(expert < 0 or expert >= self.header.num_experts for expert in route_ids):
             raise ValueError("route contains an out-of-range expert id")
@@ -1198,9 +1233,63 @@ class ExpertPackStore:
                 self._prefetch_job, key, slot_index, ram_slot, needs_read
             )
 
+    def _approx_rows(self, layer: int, rows: int, is_prefill: bool) -> list[bool]:
+        """Which rows of this update may be fetched approximately."""
+        if self.approx_draft_experts == "off" or is_prefill:
+            return [False] * rows
+        if layer == self.mtp_layer_id and self.approx_draft_layer:
+            return [True] * rows
+        period = self.approx_rows_period
+        if period <= 1 or rows <= 1:
+            return [False] * rows
+        return [(r % period) != 0 for r in range(rows)]
+
+    def _approx_plan(
+        self, layer: int, ids: list[list[int]], weights: list[list[float]] | None,
+        approx_rows: list[bool],
+    ) -> tuple[list[list[int]], list[list[int]], dict[str, int]]:
+        """Decide, per routed expert of an approximable row, whether to use it.
+
+        Policy ``vram``: keep only experts already resident in VRAM; ``ram``: keep
+        experts resident in VRAM or in the host RAM tier (an H2D copy, no SSD read).
+        Dropped positions are re-pointed at the kept expert of the same row with the
+        largest gate weight; if nothing in a row is resident, the row's largest-weight
+        expert is fetched exactly so the row never loses all its experts.
+        Returns (effective ids, keep mask 0/1, counters). Pure: no cache side effects.
+        """
+        tier = self._tier
+        eff = [list(row) for row in ids]
+        keep = [[1] * len(row) for row in ids]
+        c = {"rows": 0, "dropped_ssd": 0, "dropped_ram": 0, "forced": 0, "requests": 0}
+        for r, row in enumerate(ids):
+            if not approx_rows[r]:
+                continue
+            c["rows"] += 1
+            c["requests"] += len(row)
+            w = weights[r] if weights is not None else [0.0] * len(row)
+            in_ram = [tier.ram_slot_of((layer, e)) is not None for e in row]
+            in_vram = [(layer, e) in tier.key_to_vram for e in row]
+            resident = [
+                v or (self.approx_draft_experts == "ram" and m) for v, m in zip(in_vram, in_ram)
+            ]
+            if not any(resident):
+                best = max(range(len(row)), key=lambda j: w[j])
+                resident[best] = True
+                c["forced"] += 1
+            for j in range(len(row)):
+                if not resident[j]:
+                    c["dropped_ram" if in_ram[j] else "dropped_ssd"] += 1
+            anchor = max((j for j in range(len(row)) if resident[j]), key=lambda j: w[j])
+            for j in range(len(row)):
+                if not resident[j]:
+                    keep[r][j] = 0
+                    eff[r][j] = row[anchor]
+        return eff, keep, c
+
     def _acquire_tiered(
-        self, layer: int, topk_ids: torch.Tensor, *, is_prefill: bool
-    ) -> tuple[torch.Tensor, list[int]]:
+        self, layer: int, topk_ids: torch.Tensor, *, is_prefill: bool,
+        topk_weights: torch.Tensor | None = None,
+    ):
         assert self._tier is not None and self._cache is not None
         started_ns = time.perf_counter_ns()
         prefetch_wait_ns = 0
@@ -1208,13 +1297,30 @@ class ExpertPackStore:
         n_tier = {VRAM: 0, RAM: 0, SSD: 0}
         blk_ssd_ns = 0  # wall time this call blocked on SSD reads
         rd_ssd_ns = 0  # sum of per-object SSD read durations (max over splits)
-        route_ids = [int(value) for value in topk_ids.detach().cpu().reshape(-1)]
+        rows_ids = topk_ids.detach().cpu().tolist()
+        route_ids = [int(value) for row in rows_ids for value in row]
         if any(expert < 0 or expert >= self.header.num_experts for expert in route_ids):
             raise ValueError("route contains an out-of-range expert id")
-        requested = {(layer, expert) for expert in route_ids}
+        approx_rows = self._approx_rows(layer, len(rows_ids), is_prefill)
+        keep_mask = None
+        approx_c = None
         events: list[torch.cuda.Event] = []
         tier = self._tier
         with self._lock:
+            if any(approx_rows):
+                w_rows = (
+                    topk_weights.detach().float().cpu().tolist()
+                    if topk_weights is not None else None
+                )
+                eff, keep, approx_c = self._approx_plan(layer, rows_ids, w_rows, approx_rows)
+                route_ids = [int(value) for row in eff for value in row]
+                keep_mask = keep
+                self.stats["approx_rows"] += approx_c["rows"]
+                self.stats["approx_requests"] += approx_c["requests"]
+                self.stats["approx_dropped_ssd"] += approx_c["dropped_ssd"]
+                self.stats["approx_dropped_ram"] += approx_c["dropped_ram"]
+                self.stats["approx_forced_rows"] += approx_c["forced"]
+            requested = {(layer, expert) for expert in route_ids}
             self._drain_tier_timing()
             if layer == self._first_active_layer:
                 tier.begin_step()
@@ -1379,8 +1485,14 @@ class ExpertPackStore:
                     "t_in": started_ns, "t_out": exit_ns, "n_vram": n_tier[VRAM], "n_ram": n_tier[RAM],
                     "n_ssd": n_tier[SSD], "pf_wait_ns": prefetch_wait_ns,
                     "pf_wait_ram_ns": pf_wait_src["ram"], "pf_wait_ssd_ns": pf_wait_src["ssd"],
-                    "blk_ssd_ns": blk_ssd_ns, "rd_ssd_ns": rd_ssd_ns}) + "\n")
-        return torch.tensor(slots, dtype=torch.int32, device=cache_device), slots
+                    "blk_ssd_ns": blk_ssd_ns, "rd_ssd_ns": rd_ssd_ns,
+                    "n_drop": (approx_c["dropped_ssd"] + approx_c["dropped_ram"]) if approx_c else 0,
+                }) + "\n")
+        if keep_mask is None:
+            mask_t = torch.ones(topk_ids.shape, dtype=torch.float32, device=cache_device)
+        else:
+            mask_t = torch.tensor(keep_mask, dtype=torch.float32, device=cache_device)
+        return torch.tensor(slots, dtype=torch.int32, device=cache_device), slots, mask_t
 
     def mark_used(self, slot_indices: list[int]) -> None:
         event = torch.cuda.Event()

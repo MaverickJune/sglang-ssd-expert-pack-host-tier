@@ -72,3 +72,17 @@ The store now records per-acquire SSD blocking time (`blk_ssd_ns`, commit 0008);
 | SSD-missed experts per step | 29 of 258 requests | 61 of 476 requests |
 
 The M0 baseline of Part 4 was slowed by an NVMe latency spike (16–55 ms mean reads on two requests); the clean re-run gives 344 s, so 1-step MTP is **1.20×** end-to-end in the RAM regime.
+
+## Part 6 — approximate expert fetching for speculative draft positions (report §18)
+
+`approx_draft_experts` (commit 0009) lets the draft row of the verify batch and the MTP draft layer use only cached experts (VRAM, or VRAM+RAM). RAM regime, 1 draft step:
+
+| run | tokens/s | decode step ms | accept length | agreement with exact model (teacher-forced) |
+|---|---|---|---|---|
+| exact greedy | 2.38 | 355 | – | 96.8 % (noise floor) |
+| exact spec | 2.82 | 516 | 1.84 | 97.8 % |
+| approx `vram` | 3.10 | 434 | 1.65 | **85.6 %** |
+| approx `ram` (drop SSD-missed only) | 3.09 | 457 | 1.77 | **92.5 %** |
+| draft layer only (lossless) | 2.53 | 557 | 1.73 | 98.0 %, output identical to exact spec |
+
+The draft row's logits are the committed bonus token, so approximating it is lossy (5–11 % of tokens differ from the exact model) for a ~10 % throughput gain; the lossless variant gains nothing.

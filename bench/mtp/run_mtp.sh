@@ -5,7 +5,8 @@ NAME=$1; SPECON=$2; STEPS=$3; TOPK=$4; DRAFT=$5; HOST=${6:-33792}; VRAM=${7:-194
 ART=/root/.cache/sglang-expert-pack/deepseek-v4-flash/87d1fbae3308fd145a1d
 MT=/workspace/bench/mtp; OUT=$MT/results/$NAME; mkdir -p $OUT /opt/ep/logs
 STATS=$ART/stats_$NAME.json; rm -f $STATS
-EXTRA="\"decode_token_threshold\":$DRAFT,\"miss_tier_probe\":false,\"admission_min_accesses\":2,\"admission_window_steps\":8,\"transient_slots\":24,\"vram_admission_policy\":\"paper\",\"host_cache_mib\":$HOST,\"update_trace_path\":\"$OUT/update_trace.jsonl\""
+APPROX=${APPROX:-off}
+EXTRA="\"approx_draft_experts\":\"$APPROX\",\"decode_token_threshold\":$DRAFT,\"miss_tier_probe\":false,\"admission_min_accesses\":2,\"admission_window_steps\":8,\"transient_slots\":24,\"vram_admission_policy\":\"paper\",\"host_cache_mib\":$HOST,\"update_trace_path\":\"$OUT/update_trace.jsonl\""
 LOG=/opt/ep/logs/server_$NAME.log
 (cd /opt/ep && SPEC=$SPECON SPEC_STEPS=$STEPS SPEC_TOPK=$TOPK SPEC_DRAFT=$DRAFT CACHE_VRAM_MIB=$VRAM nohup bash $MT/launch_spec.sh /workspace/bench/launch_inputs.json true $STATS 30001 "$EXTRA" > $LOG 2>&1 & echo $! > /opt/ep/logs/server_$NAME.pid)
 PID=$(cat /opt/ep/logs/server_$NAME.pid); sleep 5

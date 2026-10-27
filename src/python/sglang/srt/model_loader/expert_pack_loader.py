@@ -302,6 +302,9 @@ class ExpertPackModelLoader(BaseModelLoader):
                 mtp_pack_path=self.config.get("mtp_pack_path"),
                 mtp_manifest_path=self.config.get("mtp_manifest_path"),
                 decode_token_threshold=int(self.config.get("decode_token_threshold", 1)),
+                approx_draft_experts=str(self.config.get("approx_draft_experts", "off")),
+                approx_rows_period=self.config.get("approx_rows_period"),
+                approx_draft_layer=bool(self.config.get("approx_draft_layer", True)),
             )
             weights = deepseek4_nonexpert_weights_iterator(
                 self.source_path, int(hf_config.num_hidden_layers)

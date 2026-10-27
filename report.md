@@ -829,3 +829,31 @@ Per-step H2D traffic (stats `h2d_bytes` / `forward_steps`, includes prefill step
 | DeepSeek-V4-Flash target (Ollama MXFP4 GGUF) | 284.3 B total: 277.0 B routed experts + 7.3 B dense (attention, shared experts, embeddings, lm_head) | 155.1 GB GGUF: 147.2 GB experts (11,008 objects × 12.75 MiB in the Expert Pack), 7.9 GB dense (Q8_0; 9.0 GB resident in VRAM after loading) |
 | MTP draft layer (HF fp4 → MXFP4 repack) | 6.44 B routed experts (256 × 25.2 M) + dense ~0.18 GB Q8_0 | 3.42 GB pack + 0.18 GB `mtp-dense.safetensors` |
 | active per token | 6 routed experts × 43 layers × 25.2 M = 6.5 B expert params + dense | 76.5 MiB of expert weights per token-layer × 43 ≈ 3.3 GB per token moved if nothing were cached |
+
+## 18. Approximate expert fetching for speculative draft positions (RAM regime)
+
+### 18.1 Idea and implementation
+
+Hypothesis (user): the verify batch fetches every routed expert of the draft token too; fetching those approximately from whatever is already cached could remove most of the extra traffic while, if the draft is accepted, keeping the speedup. Implemented as `approx_draft_experts` in `ExpertPackStore` (`"off" | "vram" | "ram"`, loader config keys `approx_draft_experts`, `approx_rows_period`, `approx_draft_layer`): for decode-like updates, row `r` is exact iff `r % approx_rows_period == 0` (period = `num_draft_tokens`, so row 0 = the last committed token stays exact and the draft rows are approximable); the MTP draft layer (43) is approximable in all rows. In an approximable row, a routed expert that is not resident in VRAM (`vram`) or in VRAM/RAM (`ram`) is dropped: its gate weight is zeroed, the remaining weights are renormalised to the row's original gate mass, and its slot is re-pointed at the row's largest-weight kept expert; if nothing is resident the largest-weight expert is fetched exactly. The plan is side-effect free (`_approx_plan`), counted in `approx_*` stats and `n_drop` in the update trace, and `acquire(..., return_mask=True)` returns the keep mask that `ExpertPackMoEMethod.apply` applies to `topk_weights`. 36 unit tests pass (4 new CPU tests of the planner, 1 GPU test).
+
+### 18.2 Results (5 prompts, 200 tokens, concurrency 1, host 33 GiB, VRAM 19456 MiB, 1 draft step / 2 verify tokens)
+
+| run | what is approximated | tokens generated | wall s (5 prompts) | tokens/s e2e | decode step ms | SSD blocked ms/step | accept length | draft-row requests dropped | teacher-forced agreement with exact model |
+|---|---|---|---|---|---|---|---|---|---|
+| A0 exact greedy (no spec) | – | 817 | 344 | 2.38 | 355 | 64 | – | – | 96.8 % (785/811; noise floor) |
+| A1 exact spec, 1 step | – | 806 | 286 | 2.82 | 516 | 125 | 1.84 | – | 97.8 % (782/800) |
+| B1 approx `vram` | verify draft row + draft layer: keep only VRAM-resident experts | 922 | 297 | 3.10 | 434 | 80 | 1.65 | 75,888 / 150,888 (50 %) | **85.6 %** (784/916) |
+| B2 approx `ram` | same rows: keep VRAM- or RAM-resident, drop only SSD-missed | 893 | 289 | 3.09 | 457 | 73 | 1.77 | 21,086 / 136,908 (15 %) | **92.5 %** (826/893) |
+| B3 approx draft layer only (`vram`, `approx_rows_period=1`) | MTP head (layer 43) only; all verify rows exact | 806 | 318 | 2.53 | 557 | 120 | 1.73 | 4,609 / 5,598 (82 %, draft layer) | 98.0 % (790/806); **outputs byte-identical to A1** |
+
+How to read it:
+
+* **Why the output can change.** The verify batch of a 1-step MTP is `[t0, d1]`. Row 0 (`t0`) is always exact and yields `t1`. When `d1 == t1` the draft is accepted and the logits of row 1 (the draft position) yield the *bonus* token `t2`, which is committed in the same step; that bonus is the whole gain of speculation (accept length 1.84 = 1 + 0.84 bonus). Approximating row 1 therefore makes `t2` an approximate-model token. Not committing it would make the gain zero. The only lossless place is the MTP head itself (B3), whose output is only a guess that verification filters.
+* **Teacher-forced agreement** = fraction of recorded output tokens that equal the argmax of the exact (non-speculative) model given the same prefix, scored with one prefill per prompt (`bench/mtp/agree.py`; `</think>`/EOS are re-inserted where the model predicts them). Even the exact greedy run scores only 96.8 % because prefill-batch numerics differ from 1-row decode numerics at near-ties, so ~97–98 % is the noise floor. B1 and B2 are clearly below it: 11 % and 5 % of their tokens are tokens the exact model would not have produced, and the first disagreement comes within the first 2–3 tokens of some prompts.
+* **Speed.** Dropping draft-row experts does shorten the step (516 → 434/457 ms, SSD blocking 125 → 80/73 ms) but also lowers the acceptance (1.84 → 1.65/1.77), because the approximated row 1 hidden state is also the MTP head's input for the next draft. Net throughput: 2.82 → 3.10/3.09 tokens/s, **+10 %**, not the large speedup hoped for, and paid for with lossy outputs.
+* **B3 (lossless)** gained nothing: the draft layer's own SSD blocking was only 1.4–3.5 ms per step, and with 82 % of its experts dropped the drafts got worse (1.73), so throughput fell to 2.53 tokens/s (part of the step-time difference, 516 → 557 ms with equal traffic, is unexplained run-to-run variance).
+* Conclusion: on this system approximate fetching for draft positions trades ~5–11 % wrong tokens for ~10 % throughput. The traffic that matters is the *exact* verify rows' RAM→VRAM promotion and SSD misses, which cannot be approximated without changing the output.
+
+### 18.3 Deliverables
+
+`bench/mtp/chain_approx.sh`, `chain_approx2.sh`, `run_mtp.sh` (`APPROX=` env), `agree.sh`/`agree.py` (teacher-forced scoring), `results/B1_*`, `B2_*`, `B3_*`, `results/agreement.{json,log}`; `run_requests.py` now also records `output_ids` so future scoring needs no re-tokenisation.

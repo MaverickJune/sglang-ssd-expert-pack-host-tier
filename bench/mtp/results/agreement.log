@@ -1,0 +1,30 @@
+[A0_exact_greedy] alpaca-37246: 192/200 agree, first disagreement at 84, inserted 0
+[A0_exact_greedy] mmlu-abstract_algebra-14: 195/200 agree, first disagreement at 63, inserted 0
+[A0_exact_greedy] alpaca-50812: 198/200 agree, first disagreement at 134, inserted 0
+[A0_exact_greedy] mmlu-moral_disputes-8315: 89/92 agree, first disagreement at 51, inserted 1
+[A0_exact_greedy] alpaca-9907: 111/119 agree, first disagreement at 30, inserted 0
+[A0_exact_greedy] TOTAL 785/811 = 96.79 %
+[A1_exact_spec] alpaca-37246: 199/200 agree, first disagreement at 70, inserted 0
+[A1_exact_spec] mmlu-abstract_algebra-14: 194/200 agree, first disagreement at 50, inserted 0
+[A1_exact_spec] alpaca-50812: 198/200 agree, first disagreement at 98, inserted 0
+[A1_exact_spec] mmlu-moral_disputes-8315: 102/105 agree, first disagreement at 19, inserted 0
+[A1_exact_spec] alpaca-9907: 89/95 agree, first disagreement at 38, inserted 1
+[A1_exact_spec] TOTAL 782/800 = 97.75 %
+[B1_approx_vram] alpaca-37246: 173/199 agree, first disagreement at 3, inserted 0
+[B1_approx_vram] mmlu-abstract_algebra-14: 166/200 agree, first disagreement at 3, inserted 0
+[B1_approx_vram] alpaca-50812: 170/200 agree, first disagreement at 17, inserted 0
+[B1_approx_vram] mmlu-moral_disputes-8315: 106/119 agree, first disagreement at 19, inserted 0
+[B1_approx_vram] alpaca-9907: 169/198 agree, first disagreement at 23, inserted 0
+[B1_approx_vram] TOTAL 784/916 = 85.59 %
+[B2_approx_ram] alpaca-37246: 180/200 agree, first disagreement at 3, inserted 0
+[B2_approx_ram] mmlu-abstract_algebra-14: 189/200 agree, first disagreement at 60, inserted 0
+[B2_approx_ram] alpaca-50812: 185/200 agree, first disagreement at 41, inserted 0
+[B2_approx_ram] mmlu-moral_disputes-8315: 120/123 agree, first disagreement at 16, inserted 0
+[B2_approx_ram] alpaca-9907: 152/170 agree, first disagreement at 2, inserted 1
+[B2_approx_ram] TOTAL 826/893 = 92.50 %
+[B3_approx_draftlayer] alpaca-37246: 199/200 agree, first disagreement at 70, inserted 0
+[B3_approx_draftlayer] mmlu-abstract_algebra-14: 194/200 agree, first disagreement at 50, inserted 0
+[B3_approx_draftlayer] alpaca-50812: 198/200 agree, first disagreement at 98, inserted 0
+[B3_approx_draftlayer] mmlu-moral_disputes-8315: 106/108 agree, first disagreement at 19, inserted 0
+[B3_approx_draftlayer] alpaca-9907: 93/98 agree, first disagreement at 38, inserted 1
+[B3_approx_draftlayer] TOTAL 790/806 = 98.01 %

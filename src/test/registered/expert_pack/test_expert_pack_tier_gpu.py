@@ -144,3 +144,32 @@ class TestTieredAcquireGPU(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestApproxAcquireGPU(unittest.TestCase):
+    def test_mask_returned_and_forced_row(self):
+        dev = torch.device("cuda")
+        with tempfile.TemporaryDirectory() as d:
+            s = _store(Path(d), host_cache_mib=1, vram_admission_policy="paper",
+                       admission_min_accesses=2, admission_window_steps=8, transient_slots=0,
+                       decode_token_threshold=2, approx_draft_experts="vram")
+            s.initialize_device_cache("cuda")
+            # exact decode row: all-ones mask, 2-tuple without return_mask
+            out = s.acquire(0, torch.tensor([[0]], device=dev))
+            self.assertEqual(len(out), 2)
+            # verify-like update: row 1 wants expert 1 which is not resident -> forced
+            slots, host, mask = s.acquire(
+                0, torch.tensor([[0], [1]], device=dev),
+                topk_weights=torch.tensor([[1.0], [1.0]], device=dev), return_mask=True)
+            self.assertEqual(mask.tolist(), [[1.0], [1.0]])
+            self.assertEqual(s.stats["approx_forced_rows"], 1)
+            self.assertEqual(s.stats["approx_rows"], 1)
+            s.mark_used(host)
+            # now expert 1 is resident; the exact row 0 asks 1, row 1 asks 1 -> kept
+            _, host, mask = s.acquire(
+                0, torch.tensor([[1], [1]], device=dev),
+                topk_weights=torch.tensor([[1.0], [1.0]], device=dev), return_mask=True)
+            self.assertEqual(mask.tolist(), [[1.0], [1.0]])
+            self.assertEqual(s.stats["approx_dropped_ssd"], 0)
+            s.close()

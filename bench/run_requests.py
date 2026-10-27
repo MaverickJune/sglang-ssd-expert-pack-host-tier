@@ -125,6 +125,7 @@ def generate(url: str, prompt: str, max_new_tokens: int, timeout: float) -> dict
     prompt_tokens = None
     cached_tokens = 0
     output = ""
+    output_ids: list = []
     finish = None
     spec_meta = {}
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -148,6 +149,10 @@ def generate(url: str, prompt: str, max_new_tokens: int, timeout: float) -> dict
                 cached_tokens = int(meta["cached_tokens"])
             if ev.get("text") is not None:
                 output = ev["text"]
+            if ev.get("output_ids"):
+                ids = list(ev["output_ids"])
+                # streaming chunks carry cumulative ids (same as text); tolerate deltas
+                output_ids = ids if ids[: len(output_ids)] == output_ids or len(ids) >= len(output_ids) else output_ids + ids
             finish = meta.get("finish_reason", finish)
             for key in ("spec_accept_rate", "spec_accept_length", "spec_verify_ct",
                         "spec_num_correct_drafts", "spec_num_proposed_drafts", "e2e_latency"):
@@ -160,7 +165,7 @@ def generate(url: str, prompt: str, max_new_tokens: int, timeout: float) -> dict
     return {
         "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
         "cached_tokens": cached_tokens,  # radix prefix-cache hits: these prompt tokens are not re-forwarded
-        "finish_reason": finish, "output": output, "ttft_s": ttft_s, "spec": spec_meta,
+        "finish_reason": finish, "output": output, "output_ids": output_ids, "ttft_s": ttft_s, "spec": spec_meta,
         "prefill_tok_s": prompt_tokens / ttft_s if ttft_s > 0 else None,
         "decode_tok_s": intervals / decode_span if decode_span > 0 else None,
         "total_s": total_s,

@@ -510,3 +510,63 @@ class ExpertPackMtpAttachTest(unittest.TestCase):
                     mtp_pack_path=mtp_pack,
                     mtp_manifest_path=bad,
                 )
+
+
+class _FakeTier:
+    def __init__(self, vram, ram):
+        self.key_to_vram = {k: i for i, k in enumerate(vram)}
+        self._ram = set(ram)
+
+    def ram_slot_of(self, key):
+        return 0 if key in self._ram else None
+
+
+class ExpertPackApproxPlanTest(unittest.TestCase):
+    """Pure planning logic of approximate expert fetching for draft rows."""
+
+    def _store(self, policy):
+        from sglang.srt.layers.moe.expert_pack import ExpertPackStore
+        s = ExpertPackStore.__new__(ExpertPackStore)
+        s.approx_draft_experts = policy
+        s.approx_rows_period = 2
+        s.approx_draft_layer = True
+        s.mtp_layer_id = 43
+        s._tier = _FakeTier(vram=[(0, 1), (0, 2)], ram=[(0, 3)])
+        return s
+
+    def test_rows_selection(self):
+        s = self._store("vram")
+        self.assertEqual(s._approx_rows(0, 1, False), [False])
+        self.assertEqual(s._approx_rows(0, 2, False), [False, True])
+        self.assertEqual(s._approx_rows(0, 4, False), [False, True, False, True])
+        self.assertEqual(s._approx_rows(0, 2, True), [False, False])  # prefill is exact
+        self.assertEqual(s._approx_rows(43, 1, False), [True])  # draft layer
+        s.approx_draft_experts = "off"
+        self.assertEqual(s._approx_rows(43, 2, False), [False, False])
+
+    def test_vram_policy_drops_ram_and_ssd_and_repoints(self):
+        s = self._store("vram")
+        ids = [[1, 3, 5], [1, 3, 5]]
+        w = [[0.5, 0.3, 0.2], [0.2, 0.5, 0.3]]
+        eff, keep, c = s._approx_plan(0, ids, w, [False, True])
+        self.assertEqual(eff[0], [1, 3, 5])  # exact row untouched
+        self.assertEqual(keep[0], [1, 1, 1])
+        self.assertEqual(eff[1], [1, 1, 1])  # dropped -> anchor (only resident expert 1)
+        self.assertEqual(keep[1], [1, 0, 0])
+        self.assertEqual(c, {"rows": 1, "requests": 3, "dropped_ssd": 1, "dropped_ram": 1, "forced": 0})
+
+    def test_ram_policy_keeps_ram_resident(self):
+        s = self._store("ram")
+        eff, keep, c = s._approx_plan(0, [[9, 9], [1, 3, 5]], [[1, 1], [0.2, 0.5, 0.3]], [False, True])
+        self.assertEqual(eff[1], [1, 3, 3])  # anchor = largest-weight kept expert (3)
+        self.assertEqual(keep[1], [1, 1, 0])
+        self.assertEqual(c["dropped_ssd"], 1)
+        self.assertEqual(c["dropped_ram"], 0)
+
+    def test_forced_row_keeps_largest_weight(self):
+        s = self._store("vram")
+        eff, keep, c = s._approx_plan(0, [[7, 8, 9]], [[0.1, 0.7, 0.2]], [True])
+        self.assertEqual(eff[0], [8, 8, 8])
+        self.assertEqual(keep[0], [0, 1, 0])
+        self.assertEqual(c["forced"], 1)
+        self.assertEqual(c["dropped_ssd"], 2)
