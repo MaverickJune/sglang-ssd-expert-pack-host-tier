@@ -1,0 +1,56 @@
+From 361ea4cb179c021f15427b102fc37a8c4ea20c67 Mon Sep 17 00:00:00 2001
+From: bench <bench@local>
+Date: Tue, 27 Oct 2026 02:30:16 +0000
+Subject: [PATCH 8/8] expert_pack: record per-acquire SSD blocking time
+ (blk_ssd_ns, rd_ssd_ns) in the update trace
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ python/sglang/srt/layers/moe/expert_pack.py | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/layers/moe/expert_pack.py b/python/sglang/srt/layers/moe/expert_pack.py
+index b0782d2..83402a2 100644
+--- a/python/sglang/srt/layers/moe/expert_pack.py
++++ b/python/sglang/srt/layers/moe/expert_pack.py
+@@ -1206,6 +1206,8 @@ class ExpertPackStore:
+         prefetch_wait_ns = 0
+         pf_wait_src = {"ram": 0, "ssd": 0}
+         n_tier = {VRAM: 0, RAM: 0, SSD: 0}
++        blk_ssd_ns = 0  # wall time this call blocked on SSD reads
++        rd_ssd_ns = 0  # sum of per-object SSD read durations (max over splits)
+         route_ids = [int(value) for value in topk_ids.detach().cpu().reshape(-1)]
+         if any(expert < 0 or expert >= self.header.num_experts for expert in route_ids):
+             raise ValueError("route contains an out-of-range expert id")
+@@ -1319,6 +1321,7 @@ class ExpertPackStore:
+                 for futures, key, where, buffer, slot_index, ram_slot, stage_index in jobs:
+                     read_ns = 0
+                     if futures:
++                        blk_start = time.perf_counter_ns()
+                         try:
+                             results = [future.result() for future in futures]
+                         except OSError:
+@@ -1326,8 +1329,10 @@ class ExpertPackStore:
+                             if ram_slot is not None:
+                                 self._ram_reading[ram_slot] -= 1
+                             raise
++                        blk_ssd_ns += time.perf_counter_ns() - blk_start
+                         read_bytes = sum(result[0] for result in results)
+                         read_ns = max(result[1] for result in results)
++                        rd_ssd_ns += read_ns
+                         self._record_read(read_bytes, read_ns)
+                         if ram_slot is not None:
+                             self._ram_reading[ram_slot] -= 1
+@@ -1373,7 +1378,8 @@ class ExpertPackStore:
+                     "s": tier.step, "l": layer, "p": int(is_prefill), "tok": int(topk_ids.shape[0]),
+                     "t_in": started_ns, "t_out": exit_ns, "n_vram": n_tier[VRAM], "n_ram": n_tier[RAM],
+                     "n_ssd": n_tier[SSD], "pf_wait_ns": prefetch_wait_ns,
+-                    "pf_wait_ram_ns": pf_wait_src["ram"], "pf_wait_ssd_ns": pf_wait_src["ssd"]}) + "\n")
++                    "pf_wait_ram_ns": pf_wait_src["ram"], "pf_wait_ssd_ns": pf_wait_src["ssd"],
++                    "blk_ssd_ns": blk_ssd_ns, "rd_ssd_ns": rd_ssd_ns}) + "\n")
+         return torch.tensor(slots, dtype=torch.int32, device=cache_device), slots
+ 
+     def mark_used(self, slot_indices: list[int]) -> None:
+-- 
+2.43.0
+

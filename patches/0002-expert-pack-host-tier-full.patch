@@ -1,5 +1,5 @@
 diff --git a/python/sglang/srt/layers/moe/expert_pack.py b/python/sglang/srt/layers/moe/expert_pack.py
-index bdbc353..b0782d2 100644
+index bdbc353..83402a2 100644
 --- a/python/sglang/srt/layers/moe/expert_pack.py
 +++ b/python/sglang/srt/layers/moe/expert_pack.py
 @@ -5,6 +5,7 @@ from __future__ import annotations
@@ -455,7 +455,7 @@ index bdbc353..b0782d2 100644
                      slot = self._cache_slots[slot_index]
                      if slot.ready is not None:
                          self._transfer_stream.wait_event(slot.ready)
-@@ -637,6 +938,444 @@ class ExpertPackStore:
+@@ -637,6 +938,450 @@ class ExpertPackStore:
              slots,
          )
  
@@ -727,6 +727,8 @@ index bdbc353..b0782d2 100644
 +        prefetch_wait_ns = 0
 +        pf_wait_src = {"ram": 0, "ssd": 0}
 +        n_tier = {VRAM: 0, RAM: 0, SSD: 0}
++        blk_ssd_ns = 0  # wall time this call blocked on SSD reads
++        rd_ssd_ns = 0  # sum of per-object SSD read durations (max over splits)
 +        route_ids = [int(value) for value in topk_ids.detach().cpu().reshape(-1)]
 +        if any(expert < 0 or expert >= self.header.num_experts for expert in route_ids):
 +            raise ValueError("route contains an out-of-range expert id")
@@ -840,6 +842,7 @@ index bdbc353..b0782d2 100644
 +                for futures, key, where, buffer, slot_index, ram_slot, stage_index in jobs:
 +                    read_ns = 0
 +                    if futures:
++                        blk_start = time.perf_counter_ns()
 +                        try:
 +                            results = [future.result() for future in futures]
 +                        except OSError:
@@ -847,8 +850,10 @@ index bdbc353..b0782d2 100644
 +                            if ram_slot is not None:
 +                                self._ram_reading[ram_slot] -= 1
 +                            raise
++                        blk_ssd_ns += time.perf_counter_ns() - blk_start
 +                        read_bytes = sum(result[0] for result in results)
 +                        read_ns = max(result[1] for result in results)
++                        rd_ssd_ns += read_ns
 +                        self._record_read(read_bytes, read_ns)
 +                        if ram_slot is not None:
 +                            self._ram_reading[ram_slot] -= 1
@@ -894,13 +899,14 @@ index bdbc353..b0782d2 100644
 +                    "s": tier.step, "l": layer, "p": int(is_prefill), "tok": int(topk_ids.shape[0]),
 +                    "t_in": started_ns, "t_out": exit_ns, "n_vram": n_tier[VRAM], "n_ram": n_tier[RAM],
 +                    "n_ssd": n_tier[SSD], "pf_wait_ns": prefetch_wait_ns,
-+                    "pf_wait_ram_ns": pf_wait_src["ram"], "pf_wait_ssd_ns": pf_wait_src["ssd"]}) + "\n")
++                    "pf_wait_ram_ns": pf_wait_src["ram"], "pf_wait_ssd_ns": pf_wait_src["ssd"],
++                    "blk_ssd_ns": blk_ssd_ns, "rd_ssd_ns": rd_ssd_ns}) + "\n")
 +        return torch.tensor(slots, dtype=torch.int32, device=cache_device), slots
 +
      def mark_used(self, slot_indices: list[int]) -> None:
          event = torch.cuda.Event()
          event.record(torch.cuda.current_stream())
-@@ -656,6 +1395,9 @@ class ExpertPackStore:
+@@ -656,6 +1401,9 @@ class ExpertPackStore:
              ):
                  self._write_stats()
                  self._last_stats_flush_calls = route_calls
@@ -910,7 +916,7 @@ index bdbc353..b0782d2 100644
  
      @property
      def device_cache(self) -> torch.Tensor:
-@@ -671,6 +1413,32 @@ class ExpertPackStore:
+@@ -671,6 +1419,32 @@ class ExpertPackStore:
          )
          value["route_calls_by_layer"] = list(self._route_calls_by_layer)
          value["route_tokens_by_layer"] = list(self._route_tokens_by_layer)
@@ -943,7 +949,7 @@ index bdbc353..b0782d2 100644
          return value
  
      def _write_stats(self) -> None:
-@@ -686,6 +1454,14 @@ class ExpertPackStore:
+@@ -686,6 +1460,14 @@ class ExpertPackStore:
          temporary.replace(self.stats_path)
  
      def close(self) -> None:
@@ -958,7 +964,7 @@ index bdbc353..b0782d2 100644
          if self._read_executor is not None:
              self._read_executor.shutdown(wait=True)
              self._read_executor = None
-@@ -694,6 +1470,13 @@ class ExpertPackStore:
+@@ -694,6 +1476,13 @@ class ExpertPackStore:
          if getattr(self, "_fd", -1) >= 0:
              os.close(self._fd)
              self._fd = -1

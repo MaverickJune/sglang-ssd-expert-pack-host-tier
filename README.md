@@ -54,7 +54,21 @@ The HF MTP shard was repacked losslessly (HF fp4 == MXFP4 up to nibble order) in
 
 | regime | baseline wall s | 1 draft step (2 verify tokens) | 2 steps | 3 steps | accept rate (1 step) |
 |---|---|---|---|---|---|
-| 33 GiB host cache | 500 | **288 (1.74×)** | 337 | 387 | 0.833 (1.84 tokens/step) |
+| 33 GiB host cache | 500 (**344 on the clean re-run A0**, see §17) | **288 (1.74× vs M0; 1.20× vs A0)** | 337 | 387 | 0.833 (1.84 tokens/step) |
 | 4 GiB host cache (SSD-bound) | 507 | 431 (1.18×) | – | 613 (slower) | 0.833 |
 
 Each extra draft token adds ~6 experts per layer to the verify step, so on this memory-bound machine the minimum config (`--speculative-num-steps 1 --speculative-num-draft-tokens 2`) is the optimum, and speculation only pays off with the RAM tier. Speculative outputs are not byte-identical to greedy (verify-batch numerics), but baselines reproduce byte-for-byte and the draft hit rate is 83 %. Assets builder and drivers: `bench/mtp/`.
+
+## Part 5 — SSD-miss share of a speculative forward pass (report §17)
+
+The store now records per-acquire SSD blocking time (`blk_ssd_ns`, commit 0008); `bench/mtp/ssd_share.py` splits each decode step (RAM regime, 33 GiB host cache):
+
+| | baseline step (1 token) | MTP step (1 draft step, 2 verify tokens, 1.84 tokens) |
+|---|---|---|
+| step interval | 355 ms | 516 ms |
+| blocked on SSD reads | 64 ms (**18 %**) | 125 ms (**24 %**; 3.5 ms of it in the draft layer) |
+| other acquire time (RAM→VRAM H2D + bookkeeping) | 46 ms (13 %) | 135 ms (26 %) |
+| compute + rest | 245 ms (69 %) | 257 ms (50 %) |
+| SSD-missed experts per step | 29 of 258 requests | 61 of 476 requests |
+
+The M0 baseline of Part 4 was slowed by an NVMe latency spike (16–55 ms mean reads on two requests); the clean re-run gives 344 s, so 1-step MTP is **1.20×** end-to-end in the RAM regime.

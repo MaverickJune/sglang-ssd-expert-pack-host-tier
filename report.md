@@ -754,7 +754,7 @@ Launch (`bench/mtp/launch_spec.sh`): the usual expert-pack command plus `--specu
 ### 16.5 Reading the numbers
 
 * **MTP works end-to-end on the pack.** The draft's acceptance rate is 83 % per proposed token (1.84 accepted tokens per step with one draft step), the range DeepSeek reports for V3-style MTP; the draft layer's 256 experts stream from the MTP pack through the same tiered cache (450 draft forwards per 5 prompts, visible as `route_calls_by_layer[43]`).
-* **With the RAM tier, 1 draft step gives 1.74× end-to-end** (500 → 288 s, 1.63 → 2.80 tokens/s). More draft steps raise the accepted length only a little (1.84 → 2.18 → 2.32) while each extra draft token adds another ~6 experts per layer to the verify step and another draft forward, so 2 and 3 steps are slower than 1 (337 s, 387 s). On this memory-bound system the optimum is the minimum configuration `--speculative-num-steps 1 --speculative-num-draft-tokens 2`.
+* **With the RAM tier, 1 draft step gives 1.74× end-to-end** (500 → 288 s, 1.63 → 2.80 tokens/s). **Correction (§17):** the M0 baseline was slowed by an NVMe latency spike (requests 3–4 read at 16.5/55.1 ms mean instead of ~6 ms, same read counts); the clean re-run A0 takes 344 s, so the honest figure is **1.20× (344 → 286 s)**. More draft steps raise the accepted length only a little (1.84 → 2.18 → 2.32) while each extra draft token adds another ~6 experts per layer to the verify step and another draft forward, so 2 and 3 steps are slower than 1 (337 s, 387 s). On this memory-bound system the optimum is the minimum configuration `--speculative-num-steps 1 --speculative-num-draft-tokens 2`.
 * **Without the RAM tier the gain shrinks to 1.18×** (507 → 431 s) and 3 steps become a 21 % *loss* (613 s): every extra verify token costs real NVMe reads (pack read 1.10 → 1.25 → 2.03 TB). Speculative decoding on an SSD-resident MoE needs the host tier to pay for its extra expert traffic.
 * **Outputs are not byte-identical to the non-speculative greedy outputs** (0/5; the common prefix is 230–240 characters ≈ 60 tokens). This is expected, not a bug: with greedy verification the accepted token is the target's argmax *computed in the verify batch* (2–4 rows through the attention/MoE kernels) rather than in the 1-row decode batch, and near-ties flip under bf16/MXFP4 numerics; the two runs then continue from different tokens. The baselines (M0, S0) reproduce the earlier runs byte-for-byte (5/5), the speculative outputs are coherent and reach the same final answers on the checked prompts (same MMLU choice D, same translation), and an 83 % draft hit rate is impossible with broken draft weights. A byte-identical check across spec/non-spec would need a verify kernel path that is bit-reproducible against decode, which SGLang does not promise.
 * **Caveats / not done.** (i) Oracle prefetch (Part 3) was left off in these runs; with speculation the per-step layer sequence is 0…42 (verify) then 43 (draft), so the trace replay would need the draft layer in its schedule. (ii) The target's verify batch is served by the same `mxfp4_matvec` path as prefill; a fused multi-row verify kernel might change the balance. (iii) Concurrency 1 only. (iv) The draft's own 256 experts compete for the same 1459 VRAM slots; a dedicated small resident region for layer 43 (≈ 6 experts/step, 3.3 GB for all 256) was not tried.
@@ -762,3 +762,70 @@ Launch (`bench/mtp/launch_spec.sh`): the usual expert-pack command plus `--specu
 ### 16.6 Deliverables
 
 `bench/mtp/build_mtp_assets.py` (+ `build_mtp_assets.log`), `launch_spec.sh`, `run_mtp.sh`, `chain_mtp.sh`, `summarize_mtp.py`, `summary.md`, `results/<run>/{pass1/requests.jsonl, stats_*.json, stats_final.json, server.log, update_trace.jsonl}`, draft assets in `/opt/ep/models/deepseek-v4-flash-mtp/` (`draft_assets.json`), code in commit `5604f50` on `expert-pack-host-tier` (`bench/patches/commits/0007-*.patch`).
+
+## 17. How much of a speculative forward pass is spent waiting on SSD misses? (RAM regime, commit `361ea4c`)
+
+### 17.1 Method
+
+`ExpertPackStore._acquire_tiered` now records, per MoE-layer call, `blk_ssd_ns` (wall time the call spent blocked in `future.result()` on SSD reads; reads of one layer are issued in parallel, so this is the critical-path cost, not the sum) and `rd_ssd_ns` (sum of the individual read durations). `bench/mtp/ssd_share.py` groups the trace by step (one target forward pass over layers 0–42 plus, with MTP, the draft layer 43 call), discards prefill steps, and divides by the step interval (layer-0 enter of step *s* to layer-0 enter of step *s+1*, i.e. what one token-step costs end-to-end including sampling, draft forward and scheduler overhead). Because every layer starts with `topk_ids.cpu()`, the CPU timeline is synchronised with the GPU at layer granularity, so these CPU-side times are the real stalls.
+
+Runs: `A0_base_ram33g_acct` (no speculation) and `A1_spec_s1d2_ram33g_acct` (1 draft step, 2 verify tokens), host 33 GiB, VRAM 19456 MiB, paper policy, transient 24, 5 prompts / 200 tokens, concurrency 1. Outputs byte-identical to M0/M1.
+
+### 17.2 Result
+
+## A0_base: 815 decode steps (forward passes), verify batch tok=1
+experts requested per step: VRAM 140.4  RAM 88.7  SSD 28.9  (SSD share of requests 11.2 %)
+layers with >=1 SSD miss per step: 19.0 of 44
+
+| per forward pass (ms) | mean | median | p90 |
+|---|---|---|---|
+| step interval (token-step wall) | 354.8 | 344.7 | 424.7 |
+| MoE layer 0 enter -> last acquire exit | 340.7 | 333.4 | 412.8 |
+| time inside acquire() (all layers) | 109.7 | 101.7 | 167.9 |
+| blocked on SSD reads | 63.8 | 58.2 | 111.4 |
+|   of which target layers 0-42 | 63.8 | 58.2 | 111.4 |
+|   of which draft layer 43 | 0.0 | 0.0 | 0.0 |
+| sum of individual SSD read durations | 93.7 | 73.6 | 179.3 |
+
+SSD blocking share of step interval: 18.0 % (ratio of sums), 17.4 % (mean of per-step ratios), median per-step 16.7 %
+non-SSD acquire overhead (RAM H2D issue + bookkeeping): 12.9 % of interval; compute+rest: 69.1 %
+mean SSD blocking per SSD-missed expert: 2.21 ms (parallel reads: sum of read durations / blocking = 1.47x)
+steps with zero SSD misses: 0/815
+
+## A1_spec_s1d2: 446 decode steps (forward passes), verify batch tok=2
+experts requested per step: VRAM 217.0  RAM 159.6  SSD 61.3  (SSD share of requests 14.0 %)
+layers with >=1 SSD miss per step: 29.9 of 44
+
+| per forward pass (ms) | mean | median | p90 |
+|---|---|---|---|
+| step interval (token-step wall) | 516.2 | 487.9 | 632.8 |
+| MoE layer 0 enter -> last acquire exit | 503.5 | 478.6 | 618.4 |
+| time inside acquire() (all layers) | 259.9 | 251.6 | 336.2 |
+| blocked on SSD reads | 124.9 | 117.1 | 196.5 |
+|   of which target layers 0-42 | 121.4 | 114.5 | 193.1 |
+|   of which draft layer 43 | 3.5 | 2.6 | 7.9 |
+| sum of individual SSD read durations | 260.9 | 206.7 | 479.0 |
+
+SSD blocking share of step interval: 24.2 % (ratio of sums), 23.3 % (mean of per-step ratios), median per-step 23.9 %
+non-SSD acquire overhead (RAM H2D issue + bookkeeping): 26.2 % of interval; compute+rest: 49.7 %
+mean SSD blocking per SSD-missed expert: 2.04 ms (parallel reads: sum of read durations / blocking = 2.09x)
+steps with zero SSD misses: 0/446
+
+
+
+Per-step H2D traffic (stats `h2d_bytes` / `forward_steps`, includes prefill steps): A0 1,725 MiB, A1 3,221 MiB; D2H demotions are zero (paper policy keeps the RAM copy, `demotions_d2h = 0`).
+
+### 17.3 Reading the numbers
+
+* **Baseline decode step (one token): 355 ms, of which 64 ms (18 %) is blocked on SSD reads.** 29 of the 258 expert requests per step (11 %) miss both VRAM and the 33 GiB RAM tier; they are spread over 19 of the 43 layers, so almost every step pays several serialised read waits (one per missing layer), 2.2 ms per missed expert on the critical path (reads inside a layer overlap 1.5×).
+* **MTP step (verify batch of 2 tokens + draft): 516 ms, of which 125 ms (24 %) is SSD blocking.** The verify batch requests 2.1× the experts (476 vs 258 per step), SSD misses double (61 per step, 14 % of requests, in 30 of 44 layers), and the draft layer 43 adds only 3.5 ms of that. Reads overlap more (2.1×) so the per-missed-expert cost falls slightly to 2.0 ms, but the share of the step rises from 18 % to 24 %.
+* **The non-SSD part of acquire grows faster than the SSD part**: 110 → 260 ms per step, 13 % → 26 % of the interval. With `demotions_d2h = 0` this is RAM→VRAM promotion H2D (3.2 GB per step through pinned memory) plus victim selection / bookkeeping for ~160 RAM hits per step. Compute and everything else: 245 ms → 257 ms (69 % → 50 % of the interval). So one MTP step costs 1.45× a baseline step and yields 1.84 tokens, i.e. the 1.20× end-to-end gain; the expert-movement cost (SSD + RAM promotion, 50 % of the step) is what caps it.
+* **Correction to §16:** M0's 500 s baseline included an NVMe latency spike (requests 3–4 read at 16.5 ms / 55.1 ms mean with identical read counts; A0 reads at 5.6 / 8.5 ms). With the clean baseline the 1-step MTP gain in the RAM regime is **1.20×**, not 1.74×. The S0/S1/M2/M3 rows were not re-run; M2/M3 remain slower than M1 in absolute terms, so the "1 step is optimal" conclusion stands.
+
+### 17.4 Model size
+
+| | parameters | bytes on disk |
+|---|---|---|
+| DeepSeek-V4-Flash target (Ollama MXFP4 GGUF) | 284.3 B total: 277.0 B routed experts + 7.3 B dense (attention, shared experts, embeddings, lm_head) | 155.1 GB GGUF: 147.2 GB experts (11,008 objects × 12.75 MiB in the Expert Pack), 7.9 GB dense (Q8_0; 9.0 GB resident in VRAM after loading) |
+| MTP draft layer (HF fp4 → MXFP4 repack) | 6.44 B routed experts (256 × 25.2 M) + dense ~0.18 GB Q8_0 | 3.42 GB pack + 0.18 GB `mtp-dense.safetensors` |
+| active per token | 6 routed experts × 43 layers × 25.2 M = 6.5 B expert params + dense | 76.5 MiB of expert weights per token-layer × 43 ≈ 3.3 GB per token moved if nothing were cached |
